@@ -1,0 +1,8 @@
+# Install in the project .venv. Exact installed versions are in requirements-lock.txt.
+numpy>=2.3,<3
+scipy>=1.16,<2
+pandas>=2.3,<4
+scikit-learn>=1.7,<2
+pyserial>=3.5,<4
+requests>=2.32,<3
+python-dotenv>=1.1,<2
