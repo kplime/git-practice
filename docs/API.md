@@ -2,6 +2,8 @@
 
 HTTP JSON은 **camelCase**, PostgreSQL 열 이름은 snake_case다. Python 내부 변수나 원시 CSI 파일 형식은 별도로 정한다. 이 문서는 현재 Express 서버의 계약이며 Push·로그인·CSI 추론은 포함하지 않는다.
 
+소개서 기준 프로젝트 설명은 [프로젝트 설명](./PROJECT_PLAN.md)을 참고한다. 아래 계약은 현재 실행 코드에서 제공하는 API다.
+
 ## 공통
 
 - 기본 주소: `http://127.0.0.1:3002`. 웹과 API를 같은 Node 서버에서 제공한다.
@@ -145,7 +147,7 @@ Python의 `detection_policy.py`는 bed_monitoring_active(settings, at)와 detect
 
 저장 성공 시 서버 version이 증가한다. 실제 Python 게이트웨이는 `/api/gateway/settings`를 주기적으로 조회한 뒤 타이머 설정을 적용하고 다음 heartbeat에 appliedSettingsVersion을 보고해야 한다. 조회만 성공했다고 보고하지 않는다. 연결이 살아 있고 appliedVersion과 저장한 version이 같을 때만 웹은 '적용됨'을 표시한다. 나머지는 '적용 확인 중' 또는 '연결 필요'다. 서버 수신·표시 계약과 샘플 시뮬레이터는 구현했으나 실제 CSI 타이머 적용 코드는 후속 개발이다.
 
-보호자 인증·권한, 실제 CSI 침대 이탈 타이머와 설정 적용, Push 구독·시험·전송 worker와 HTTPS는 후속 작업이다. 기획 문서의 관련 코드와 테이블은 목표 설계다.
+보호자 인증·권한, 실제 CSI 분석과 설정 적용, 원격 Push는 구현 전이다.
 
 ## 브라우저 알림 사용 설정
 

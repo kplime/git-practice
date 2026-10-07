@@ -2,7 +2,9 @@
 
 팀명은 **부캉이**, 아이디어명은 **온가드(OnGuard)**다. 의미는 **Wi‑Fi 센싱 기반 비촬영 생활안전 보조 시스템**이다.
 
-정리 기준일: 2026-10-07. 저장소는 [kplime/git-practice](https://github.com/kplime/git-practice), 프로젝트 루트 폴더는 `git-practice`, 기본 브랜치는 `main`이다. 현재 공유 범위는 보호자 모바일 웹과 Express/PostgreSQL API 시제품, Python 환경·전송 도구·감지 정책이다. 실제 CSI 감지 모델·미복귀 타이머·자동 장애 사건·원격 Push는 미구현 후보이며 [README](../README.md#다음-구현-후보--미구현)에 정리했다.
+정리 기준일: 2026-10-07. 저장소는 [kplime/git-practice](https://github.com/kplime/git-practice), 프로젝트 루트 폴더는 `git-practice`, 기본 브랜치는 `main`이다. 현재 공유 범위는 보호자 모바일 웹과 Express/PostgreSQL API 시제품, Python 환경·전송 도구·감지 정책이다. 실제 CSI 감지 모델·장시간 저활동·원격 알림은 구현 전이며 [README](../README.md#다음-구현-후보--미구현)에 정리했다.
+
+프로젝트 소개는 [소개서 반영 요약](./IDEA_ALIGNMENT.md)과 [프로젝트 설명](./PROJECT_PLAN.md)을 기준으로 한다.
 
 ## 공유할 파일
 
@@ -13,11 +15,11 @@
 | `scripts/` | 환경·DB 설정과 검증 도구 |
 | `python/` | Python 소스와 requirements 파일. `__pycache__` 제외 |
 | `tests/` | 웹·Python 정책 검증 소스. `__pycache__` 제외 |
-| `docs/` | API 계약·프로젝트 설계·화면 검토·공유 안내 |
+| `docs/` | API 계약·프로젝트 설명·화면 검토·공유 안내 |
 | `README.md`, `package.json`, `package-lock.json` | 실행 안내·Node 의존성 |
 | `.gitignore`, `.gitattributes`, `.env.example` | 제외 규칙·줄바꿈 규칙·비밀값 없는 설정 예제 |
 
-프로젝트 기획 문서는 `PROJECT_PLAN.md`로 이름을 정리했다. 특정 질환·야간 제한 없이 한 공간부터 진행하는 현재 목표를 따른다.
+프로젝트 기획 문서는 `PROJECT_PLAN.md`로 이름을 정리했다. 제공된 아이디어 소개서의 목표와 주요 기능을 설명한다.
 
 ## 각 PC에서 생성할 파일
 
