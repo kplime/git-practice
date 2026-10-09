@@ -3,13 +3,31 @@
   const $ = (id) => document.getElementById(id);
   const types = {
     FALL_SUSPECTED: ['낙상 의심', '낙상과 유사한 움직임 패턴이 감지되었습니다. 직접 상태를 확인해 주세요.'],
-    NON_RETURN_WARNING: ['미복귀', '침대 이탈 추정 후 기준 시간 내 복귀가 확인되지 않았습니다.'],
+    LOW_ACTIVITY: ['장시간 저활동', '낮은 활동 지표가 설정한 시간 동안 이어졌습니다. 직접 상태를 확인해 주세요.'],
+    NON_RETURN_WARNING: ['미복귀 · 이전 기록', '기능 정리 전에 저장된 미복귀 사건입니다. 현재 감지 유형에는 포함되지 않습니다.'],
     SENSOR_UNAVAILABLE: ['장애 · 센싱 연결', 'CSI 수집 또는 품질에 문제가 있어 관측 상태를 확인할 수 없습니다.'],
     GATEWAY_OFFLINE: ['장애 · 기기 통신', '연결이 끊겨 감지 상태를 확인할 수 없습니다.'],
   };
   const states = { OPEN: '미확인', ACKNOWLEDGED: '확인됨', RESOLVED: '해소됨' };
-  const typeIcons = { FALL_SUSPECTED: 'i-alert', NON_RETURN_WARNING: 'i-bed', SENSOR_UNAVAILABLE: 'i-wifi', GATEWAY_OFFLINE: 'i-monitor' };
+  const typeIcons = { FALL_SUSPECTED: 'i-alert', LOW_ACTIVITY: 'i-low-activity', NON_RETURN_WARNING: 'i-list', SENSOR_UNAVAILABLE: 'i-wifi', GATEWAY_OFFLINE: 'i-monitor' };
   const qualities = { AVAILABLE: '사용 가능', DEGRADED: '품질 저하', UNAVAILABLE: '사용 불가', UNKNOWN: '확인 불가' };
+  const validActivityScore = value => typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1;
+  const validLowMinutes = value => Number.isInteger(value) && value >= 1 && value <= 1440;
+  const activityNumber = value => Number(value.toFixed(2)) === value ? value.toFixed(2) : String(value);
+  const validActivityVersion = value => typeof value === 'string' && value.trim().length > 0 && value.length <= 100;
+  const validScheduleTime = value => typeof value === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(value);
+  const sensitivityNumber = threshold => String(Number((threshold * 10).toPrecision(12)));
+  // Keep an existing precise threshold until the user moves the sensitivity control.
+  let draftActivityThreshold = 0.2;
+  function lowActivityScheduled(settings, at = Date.now()) {
+    if (!settings.lowActivityMode || settings.lowActivityMode === 'ALL_DAY') return true;
+    if (settings.lowActivityMode !== 'TIME_RANGE' || !validScheduleTime(settings.lowActivityStart) || !validScheduleTime(settings.lowActivityEnd)) return false;
+    const minutes = value => Number(value.slice(0, 2)) * 60 + Number(value.slice(3));
+    const korea = new Date(at + 9 * 3600000);
+    const current = korea.getUTCHours() * 60 + korea.getUTCMinutes();
+    const start = minutes(settings.lowActivityStart), end = minutes(settings.lowActivityEnd);
+    return start < end ? current >= start && current < end : start > end && (current >= start || current < end);
+  }
   let filter = '';
   let stateFilter = '';
   let period = { from: '', to: '' };
@@ -172,11 +190,43 @@
     return {
       gateway: { connected: false, receivedAt: null, ageSeconds: null },
       sensor: { available: false, qualityStatus: 'UNKNOWN', measuredAt: null, ageSeconds: null, fresh: false },
-      bedState: 'UNKNOWN', bedExitedAt: null,
+      activity: null,
       fetchedAt: result.fetchedAt,
       settings: result.settings ? { ...result.settings, appliedVersion: null } : undefined,
       isDemo: false,
     };
+  }
+
+  function renderActivity() {
+    const status = latestStatus;
+    const raw = status?.activity;
+    const measured = status?.sensor.measuredAt ? Date.parse(status.sensor.measuredAt) : NaN;
+    const started = raw?.windowStartedAt ? Date.parse(raw.windowStartedAt) : NaN;
+    const age = Date.now() - measured;
+    const valid = status?.isDemo === false && status.gateway.connected && status.sensor.available === true &&
+      status.sensor.fresh === true && status.sensor.qualityStatus === 'AVAILABLE' &&
+      raw && validActivityScore(raw.score) && validActivityVersion(raw.modelVersion) && validActivityVersion(raw.calibrationVersion) && Number.isFinite(started) &&
+      measured > started && measured - started <= 15000 && age >= -5000 && age <= 15000;
+    $('activity-meter').hidden = !valid;
+    text('activity-score', valid ? activityNumber(raw.score) : '—');
+    text('activity-measured-at', valid ? time(status.sensor.measuredAt) : '기록 없음');
+    if (!valid) {
+      text('activity-state', '확인 불가');
+      text('activity-help', '현재 활동 지표를 확인할 수 없어요.');
+      $('activity-meter').removeAttribute('aria-valuetext');
+      return;
+    }
+    $('activity-meter').value = raw.score;
+    $('activity-meter').setAttribute('aria-valuetext', activityNumber(raw.score));
+    const applied = savedSettings && status.settings?.appliedVersion === savedSettings.version &&
+      validActivityScore(savedSettings.lowActivityThreshold);
+    if (applied && savedSettings.lowActivityEnabled === true && !lowActivityScheduled(savedSettings)) {
+      text('activity-state', '측정됨');
+      text('activity-help', '지정한 저활동 감지 시간대 밖이에요.');
+      return;
+    }
+    text('activity-state', !applied ? '측정됨' : raw.score <= savedSettings.lowActivityThreshold ? '낮은 활동' : '활동 변화');
+    text('activity-help', applied ? '지표가 낮을수록 움직임 변화가 작아요.' : '감지 기준의 기기 적용을 확인하고 있어요.');
   }
 
   async function loadStatus() {
@@ -197,16 +247,6 @@
       const age = result.sensor.measuredAt && Number.isFinite(result.sensor.ageSeconds) && result.sensor.ageSeconds >= 0
         ? `마지막 측정 ${result.sensor.ageSeconds}초 전` : '측정 기록 없음';
       text('observation-age', `${age}${result.fetchedAt ? ` · 조회 ${time(result.fetchedAt)}` : ''}`);
-      text('bed-state', !observable ? '현재 상태를 확인할 수 없어요.' : ({ IN_BED: '침대에 있는 것으로 보여요.', OUT_OF_BED: '침대에서 나온 것으로 보여요.', UNKNOWN: '상태를 확인할 수 없어요.' }[result.bedState] || '상태를 확인할 수 없어요.'));
-      const exitedMs = result.bedExitedAt ? Date.parse(result.bedExitedAt) : NaN;
-      const elapsed = Math.floor((Date.now() - exitedMs) / 60000);
-      $('bed-exit-info').hidden = !observable || result.bedState !== 'OUT_OF_BED' || !Number.isFinite(elapsed) || elapsed < 0;
-      $('bed-exited-at').hidden = $('bed-exit-info').hidden;
-      if (!$('bed-exit-info').hidden) {
-        text('bed-exited-at', `이탈 추정 시각 · ${time(result.bedExitedAt)}`);
-        const applied = result.settings?.appliedVersion === result.settings?.version;
-        text('bed-exit-info', `이탈 추정 ${elapsed}분 경과 · ${applied ? result.settings.bedMonitoringEnabled === false ? '미복귀 감지 꺼짐' : `미복귀 기준 ${result.settings.nonReturnMinutes}분 · ${bedMonitoringSummary(result.settings)}` : '기준 시간 적용 확인 중'}`);
-      }
       if (result.settings) renderSettings(result.settings, !settingsDirty && !settingsSaving);
       renderSettingsApplication();
     } catch (error) {
@@ -218,10 +258,7 @@
       text('sensor-quality', '최신 상태를 조회하지 못했습니다.');
       text('gateway-state', '연결 상태 확인 불가');
       text('gateway-id', '연결을 확인해 주세요.');
-      text('bed-state', '현재 상태를 확인할 수 없어요.');
       text('observation-age', '최신 측정 상태를 조회하지 못했어요.');
-      $('bed-exited-at').hidden = true;
-      $('bed-exit-info').hidden = true;
       renderSettingsApplication();
       throw error;
     }
@@ -260,6 +297,20 @@
     text('detail-type', types[event.type]?.[0] || event.type);
     $('detail-icon').querySelector('use').setAttribute('href', `#${typeIcons[event.type] || 'i-list'}`);
     text('detail-description', types[event.type]?.[1] || '사건을 확인하세요.');
+    $('detail-low-activity').hidden = event.type !== 'LOW_ACTIVITY';
+    if (event.type === 'LOW_ACTIVITY') {
+      const details = event.details || {};
+      text('detail-low-since', time(details.lowSince));
+      const seconds = typeof details.durationSeconds === 'number' && Number.isFinite(details.durationSeconds) && details.durationSeconds >= 0
+        ? Math.floor(details.durationSeconds) : null;
+      text('detail-low-duration', seconds === null ? '기록 없음' : `${Math.floor(seconds / 60)}분 ${seconds % 60}초`);
+      text('detail-low-criteria', validLowMinutes(details.thresholdMinutes) && validActivityScore(details.activityThreshold)
+        ? `${details.thresholdMinutes}분 · 민감도 ${sensitivityNumber(details.activityThreshold)}` : '기록 없음');
+      text('detail-low-score', validActivityScore(details.activityScore) ? activityNumber(details.activityScore) : '기록 없음');
+      text('detail-low-schedule', details.monitoringMode === 'ALL_DAY' ? '상시' :
+        details.monitoringMode === 'TIME_RANGE' && validScheduleTime(details.monitoringStart) && validScheduleTime(details.monitoringEnd)
+          ? `${details.monitoringStart}~${details.monitoringEnd} (한국 시간)` : '기록 없음');
+    }
     text('detail-state', states[event.state] || event.state);
     $('detail-state').classList.toggle('alert', event.state === 'OPEN');
     $('detail-state').classList.toggle('success', event.state === 'RESOLVED');
@@ -317,27 +368,29 @@
   }
 
   function settingsControls(enabled) {
-    for (const id of ['bed-monitoring-enabled', 'bed-monitoring-mode', 'bed-monitoring-start', 'bed-monitoring-end', 'non-return-minutes', 'minutes-minus', 'minutes-plus', 'fall-alert-enabled', 'sensor-fault-alert-enabled', 'gateway-fault-alert-enabled', 'settings-save']) $(id).disabled = !enabled;
-    updateBedMonitoringControls(enabled);
+    for (const id of ['low-activity-enabled', 'fall-alert-enabled', 'sensor-fault-alert-enabled', 'gateway-fault-alert-enabled', 'settings-save']) $(id).disabled = !enabled;
+    updateLowActivityControls(enabled);
     updateSettingsNotice();
   }
   function settingsValues(settings) {
     const source = settings || {
-      nonReturnMinutes: $('non-return-minutes').value,
-      bedMonitoringEnabled: $('bed-monitoring-enabled').checked,
-      bedMonitoringMode: $('bed-monitoring-mode').value,
-      bedMonitoringStart: $('bed-monitoring-start').value,
-      bedMonitoringEnd: $('bed-monitoring-end').value,
+      lowActivityEnabled: $('low-activity-enabled').checked,
+      lowActivityMinutes: $('low-activity-minutes').value,
+      lowActivityThreshold: draftActivityThreshold,
+      lowActivityMode: $('low-activity-mode').value,
+      lowActivityStart: $('low-activity-start').value,
+      lowActivityEnd: $('low-activity-end').value,
       fallAlertEnabled: $('fall-alert-enabled').checked,
       sensorFaultAlertEnabled: $('sensor-fault-alert-enabled').checked,
       gatewayFaultAlertEnabled: $('gateway-fault-alert-enabled').checked,
     };
     return {
-      nonReturnMinutes: Number(source.nonReturnMinutes ?? 10),
-      bedMonitoringEnabled: source.bedMonitoringEnabled !== false,
-      bedMonitoringMode: source.bedMonitoringMode || 'ALL_DAY',
-      bedMonitoringStart: source.bedMonitoringStart || '22:00',
-      bedMonitoringEnd: source.bedMonitoringEnd || '07:00',
+      lowActivityEnabled: source.lowActivityEnabled === true,
+      lowActivityMinutes: source.lowActivityMinutes === '' ? '' : Number(source.lowActivityMinutes ?? 30),
+      lowActivityThreshold: source.lowActivityThreshold === '' ? '' : Number(source.lowActivityThreshold ?? 0.2),
+      lowActivityMode: source.lowActivityMode ?? 'ALL_DAY',
+      lowActivityStart: source.lowActivityStart ?? '22:00',
+      lowActivityEnd: source.lowActivityEnd ?? '07:00',
       fallAlertEnabled: source.fallAlertEnabled !== false,
       sensorFaultAlertEnabled: source.sensorFaultAlertEnabled !== false,
       gatewayFaultAlertEnabled: source.gatewayFaultAlertEnabled !== false,
@@ -352,22 +405,25 @@
   function settingsChanged() {
     settingsDirty = !savedSettings || JSON.stringify(settingsValues()) !== JSON.stringify(settingsValues(savedSettings));
     $('settings-message').hidden = true;
-    updateBedMonitoringControls();
+    updateLowActivityControls(settingsLoaded && !settingsSaving);
     updateSettingsNotice();
   }
-  function bedMonitoringSummary(settings) {
-    if (settings.bedMonitoringEnabled === false) return '미복귀 감지 꺼짐';
-    if (settings.bedMonitoringMode !== 'TIME_RANGE') return '상시 감지';
-    return `매일 ${settings.bedMonitoringStart} ~ ${settings.bedMonitoringEnd}${settings.bedMonitoringStart > settings.bedMonitoringEnd ? ' (다음 날)' : ''} · 한국 시간`;
-  }
-  function updateBedMonitoringControls(enabled = settingsLoaded && !settingsSaving) {
-    const monitoring = $('bed-monitoring-enabled').checked;
-    const scheduled = $('bed-monitoring-mode').value === 'TIME_RANGE';
-    $('bed-monitoring-mode').disabled = !enabled || !monitoring;
-    $('bed-monitoring-times').hidden = !scheduled;
-    for (const id of ['bed-monitoring-start', 'bed-monitoring-end']) { $(id).disabled = !enabled || !monitoring || !scheduled; $(id).required = monitoring && scheduled; }
-    for (const id of ['non-return-minutes', 'minutes-minus', 'minutes-plus']) $(id).disabled = !enabled || !monitoring;
-    text('bed-monitoring-summary', bedMonitoringSummary({ bedMonitoringEnabled: monitoring, bedMonitoringMode: $('bed-monitoring-mode').value, bedMonitoringStart: $('bed-monitoring-start').value, bedMonitoringEnd: $('bed-monitoring-end').value }));
+  function updateLowActivityControls(enabled) {
+    const active = enabled && $('low-activity-enabled').checked;
+    for (const id of ['low-activity-minutes', 'low-activity-sensitivity', 'low-activity-mode']) {
+      $(id).disabled = !active;
+      $(id).required = id === 'low-activity-minutes' && active;
+    }
+    const timed = $('low-activity-mode').value === 'TIME_RANGE';
+    $('low-activity-time-fields').hidden = !timed;
+    $('low-activity-schedule-help').hidden = !timed;
+    for (const id of ['low-activity-start', 'low-activity-end']) {
+      $(id).disabled = !active || !timed;
+      $(id).required = active && timed;
+    }
+    const sensitivity = sensitivityNumber(draftActivityThreshold);
+    text('low-activity-sensitivity-value', sensitivity);
+    $('low-activity-sensitivity').setAttribute('aria-valuetext', `민감도 ${sensitivity}, 0에서 10 사이`);
   }
   function renderSettingsApplication() {
     const connected = latestStatus?.gateway.connected;
@@ -380,26 +436,31 @@
     if (savedSettings) {
       text('settings-updated', `마지막 저장 · ${time(savedSettings.updatedAt)}`);
       $('settings-alerts').replaceChildren(...[
-        ['미복귀 감지', 'bedMonitoringEnabled'],
-        ['낙상 의심 감지', 'fallAlertEnabled'], ['센싱 장애 감지', 'sensorFaultAlertEnabled'], ['기기 통신 장애 감지', 'gatewayFaultAlertEnabled'],
+        ['장시간 저활동 감지', 'lowActivityEnabled'], ['낙상 의심 감지', 'fallAlertEnabled'], ['센싱 장애 감지', 'sensorFaultAlertEnabled'], ['기기 통신 장애 감지', 'gatewayFaultAlertEnabled'],
       ].map(([label, key]) => {
-        const off = savedSettings[key] === false;
+        const off = key === 'lowActivityEnabled' ? savedSettings[key] !== true : savedSettings[key] === false;
         const chip = node('span', undefined, `detection-chip${off ? ' off' : ''}`);
         chip.append(node('span', `${label} `), node('strong', off ? '꺼짐' : '켜짐'));
+        if (key === 'lowActivityEnabled' && !off && validLowMinutes(savedSettings.lowActivityMinutes) && validActivityScore(savedSettings.lowActivityThreshold)) {
+          chip.append(node('span', `· ${savedSettings.lowActivityMinutes}분 · 민감도 ${sensitivityNumber(savedSettings.lowActivityThreshold)} · ${savedSettings.lowActivityMode === 'TIME_RANGE' ? `${savedSettings.lowActivityStart}~${savedSettings.lowActivityEnd} (한국 시간)` : '상시'}`, 'criteria'));
+        }
         return chip;
       }));
     }
+    renderActivity();
   }
   function renderSettings(result, setInput = true) {
     if (savedSettings && result.version < savedSettings.version) return;
     savedSettings = result;
     settingsLoaded = true;
     if (setInput) {
-      $('non-return-minutes').value = result.nonReturnMinutes;
-      $('bed-monitoring-enabled').checked = result.bedMonitoringEnabled !== false;
-      $('bed-monitoring-mode').value = result.bedMonitoringMode || 'ALL_DAY';
-      $('bed-monitoring-start').value = result.bedMonitoringStart || '22:00';
-      $('bed-monitoring-end').value = result.bedMonitoringEnd || '07:00';
+      $('low-activity-enabled').checked = result.lowActivityEnabled === true;
+      $('low-activity-minutes').value = result.lowActivityMinutes ?? 30;
+      draftActivityThreshold = result.lowActivityThreshold ?? 0.2;
+      $('low-activity-sensitivity').value = sensitivityNumber(draftActivityThreshold);
+      $('low-activity-mode').value = result.lowActivityMode ?? 'ALL_DAY';
+      $('low-activity-start').value = result.lowActivityStart ?? '22:00';
+      $('low-activity-end').value = result.lowActivityEnd ?? '07:00';
       $('fall-alert-enabled').checked = result.fallAlertEnabled !== false;
       $('sensor-fault-alert-enabled').checked = result.sensorFaultAlertEnabled !== false;
       $('gateway-fault-alert-enabled').checked = result.gatewayFaultAlertEnabled !== false;
@@ -638,14 +699,13 @@
     if ($('resolve-button').disabled) return;
     mutateEvent('resolve', { observed: $('observed').checked, reason: $('reason').value.trim() });
   });
-  for (const [id, delta] of [['minutes-minus', -1], ['minutes-plus', 1]]) $(id).addEventListener('click', () => {
-    $('non-return-minutes').value = Math.min(1440, Math.max(1, Number($('non-return-minutes').value) + delta));
-    settingsChanged();
-  });
-  $('non-return-minutes').addEventListener('input', settingsChanged);
-  for (const id of ['bed-monitoring-enabled', 'bed-monitoring-mode', 'bed-monitoring-start', 'bed-monitoring-end', 'fall-alert-enabled', 'sensor-fault-alert-enabled', 'gateway-fault-alert-enabled']) {
+  for (const id of ['low-activity-enabled', 'low-activity-minutes', 'low-activity-sensitivity', 'low-activity-mode', 'low-activity-start', 'low-activity-end', 'fall-alert-enabled', 'sensor-fault-alert-enabled', 'gateway-fault-alert-enabled']) {
     const changed = () => {
-      if (['bed-monitoring-start', 'bed-monitoring-end'].includes(id) && $('bed-monitoring-enabled').checked) $('bed-monitoring-mode').value = 'TIME_RANGE';
+      if (id === 'low-activity-sensitivity') {
+        const value = Math.round(Number($('low-activity-sensitivity').value));
+        $('low-activity-sensitivity').value = String(value);
+        draftActivityThreshold = value / 10;
+      }
       settingsChanged();
     };
     $(id).addEventListener('input', changed);
@@ -653,36 +713,35 @@
   }
   $('settings-form').addEventListener('submit', async (event) => {
     event.preventDefault();
-    const minutes = Number($('non-return-minutes').value);
     if (settingsSaving || !settingsLoaded) return;
-    if (!Number.isInteger(minutes) || minutes < 1 || minutes > 1440) { text('settings-message', '1~1440분 정수를 입력하세요.'); $('settings-message').hidden = false; return; }
-    const bedSettings = {
-      bedMonitoringEnabled: $('bed-monitoring-enabled').checked,
-      bedMonitoringMode: $('bed-monitoring-mode').value,
-      bedMonitoringStart: $('bed-monitoring-start').value,
-      bedMonitoringEnd: $('bed-monitoring-end').value,
-    };
-    if (bedSettings.bedMonitoringEnabled && bedSettings.bedMonitoringMode === 'TIME_RANGE' &&
-        (!bedSettings.bedMonitoringStart || !bedSettings.bedMonitoringEnd || bedSettings.bedMonitoringStart === bedSettings.bedMonitoringEnd)) {
-      text('settings-message', '시작·종료 시간을 다르게 지정해 주세요. 하루 종일 감지하려면 상시를 선택해 주세요.');
+    const values = settingsValues();
+    if (values.lowActivityEnabled && (!validLowMinutes(values.lowActivityMinutes) || !validActivityScore(values.lowActivityThreshold))) {
+      text('settings-message', '지속 시간은 1~1440분 정수, 민감도는 0~10으로 지정해 주세요.');
       $('settings-message').hidden = false;
       return;
     }
-    const validTime = (value) => /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(value);
-    if (!bedSettings.bedMonitoringEnabled || bedSettings.bedMonitoringMode === 'ALL_DAY') {
-      if (!validTime(bedSettings.bedMonitoringStart)) bedSettings.bedMonitoringStart = savedSettings?.bedMonitoringStart || '22:00';
-      if (!validTime(bedSettings.bedMonitoringEnd)) bedSettings.bedMonitoringEnd = savedSettings?.bedMonitoringEnd || '07:00';
+    // Turning detection off must work even while the disabled fields are empty.
+    if (!values.lowActivityEnabled) {
+      values.lowActivityMinutes = validLowMinutes(values.lowActivityMinutes) ? values.lowActivityMinutes : savedSettings?.lowActivityMinutes ?? 30;
+      values.lowActivityThreshold = validActivityScore(values.lowActivityThreshold) ? values.lowActivityThreshold : savedSettings?.lowActivityThreshold ?? 0.2;
+    }
+    if (values.lowActivityEnabled && values.lowActivityMode === 'TIME_RANGE' &&
+        (!validScheduleTime(values.lowActivityStart) || !validScheduleTime(values.lowActivityEnd) || values.lowActivityStart === values.lowActivityEnd)) {
+      text('settings-message', '감지 시작·종료 시각을 다르게 지정해 주세요. 상시 감지는 상시를 선택하세요.');
+      $('settings-message').hidden = false;
+      return;
+    }
+    if (!values.lowActivityEnabled || values.lowActivityMode === 'ALL_DAY') {
+      if (!validScheduleTime(values.lowActivityStart) || !validScheduleTime(values.lowActivityEnd) || values.lowActivityStart === values.lowActivityEnd) {
+        values.lowActivityStart = savedSettings?.lowActivityStart ?? '22:00';
+        values.lowActivityEnd = savedSettings?.lowActivityEnd ?? '07:00';
+      }
     }
     settingsSaving = true;
     $('settings-message').hidden = true;
     settingsControls(false);
     try {
-      renderSettings(await api('/settings', { method: 'PATCH', body: JSON.stringify({
-        nonReturnMinutes: minutes, ...bedSettings,
-        fallAlertEnabled: $('fall-alert-enabled').checked,
-        sensorFaultAlertEnabled: $('sensor-fault-alert-enabled').checked,
-        gatewayFaultAlertEnabled: $('gateway-fault-alert-enabled').checked,
-      }) }));
+      renderSettings(await api('/settings', { method: 'PATCH', body: JSON.stringify(values) }));
       text('settings-message', '변경 내용을 저장했어요.');
       $('settings-message').hidden = false;
     } catch { settingsDirty = true; text('settings-message', '저장하지 못했어요. 다시 시도해 주세요.'); $('settings-message').hidden = false; }

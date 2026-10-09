@@ -8,6 +8,7 @@
 <meta name="author" content="부캉이">
 <link rel="stylesheet" href="styles.css">
 <script src="app.js" defer></script>
+<script src="activity-history.js" defer></script>
 </head>
 
 <body>
@@ -39,9 +40,6 @@
     <rect x="3" y="4" width="18" height="13" rx="2"/>
     <path d="M12 17v4M8 21h8"/>
   </symbol>
-  <symbol id="i-bed" viewBox="0 0 24 24">
-    <path d="M3 20V7M21 20V11H3M3 16h18M7 11V6h10v5"/>
-  </symbol>
   <symbol id="i-check" viewBox="0 0 24 24">
     <path d="m5 12 4 4L19 6"/>
   </symbol>
@@ -49,8 +47,8 @@
     <rect x="6" y="2" width="12" height="20" rx="2"/>
     <path d="M11 18h2"/>
   </symbol>
+  <symbol id="i-low-activity" viewBox="0 0 24 24"><path d="m3 7 6 6 4-4 8 8m-5 0h5v-5"/></symbol>
 </svg>
-
 <div class="app">
   <header class="header">
     <span class="brand-mark">
@@ -80,14 +78,56 @@
         <p id="observation-age" class="small muted">측정 기록을 확인하고 있어요.</p>
         <button class="button" id="refresh-button" type="button">새로고침</button>
       </section>
-      <section class="section"><h2 class="with-icon"><svg class="icon" aria-hidden="true"><use href="#i-bed"/></svg>침대 상태</h2><p id="bed-state">확인 중</p><p id="bed-exited-at" class="small muted" hidden></p><p id="bed-exit-info" class="small" hidden></p><p class="small muted">움직임을 바탕으로 추정한 상태입니다. 필요하면 직접 확인해 주세요.</p></section>
+      <section class="section white" id="activity-summary" aria-labelledby="activity-title">
+        <div class="section-head"><h2 id="activity-title">현재 활동</h2><span class="badge" id="activity-state">확인 중</span></div>
+        <div class="activity-value"><span>활동 지표</span><strong id="activity-score">—</strong></div>
+        <meter id="activity-meter" min="0" max="1" value="0" aria-label="활동 지표, 0에서 1 사이" hidden></meter>
+        <dl><div class="row"><dt>측정 시각</dt><dd id="activity-measured-at">기록 없음</dd></div></dl>
+        <p class="small muted" id="activity-help">활동 지표를 확인하고 있어요.</p>
+      </section>
+      <section class="section white" id="activity-history" aria-labelledby="history-title">
+        <div class="section-head"><h2 id="history-title">활동 추이</h2><button class="filter" id="history-refresh" type="button">새로고침</button></div>
+        <div class="filters history-presets" role="group" aria-label="활동 조회 기간">
+          <button class="filter selected" data-history-hours="1" type="button" aria-pressed="true">1시간</button>
+          <button class="filter" data-history-hours="6" type="button" aria-pressed="false">6시간</button>
+          <button class="filter" data-history-hours="24" type="button" aria-pressed="false">24시간</button>
+        </div>
+        <details class="period-panel" id="history-period-panel">
+          <summary>기간 직접 지정</summary>
+          <form class="period-form" id="history-period-form" aria-label="활동 조회 기간" novalidate>
+            <div class="period-dates">
+              <label for="history-start-date">시작일<input id="history-start-date" type="date" required></label>
+              <label for="history-end-date">종료일<input id="history-end-date" type="date" required></label>
+              <label for="history-start-time">시작 시각 · 선택<input id="history-start-time" type="time" step="60"></label>
+              <label for="history-end-time">종료 시각 · 선택<input id="history-end-time" type="time" step="60"></label>
+            </div>
+            <p class="small muted">최대 7일. 시각을 비우면 날짜 전체, 지정하면 종료 시각의 해당 분까지 조회해요.</p>
+            <button class="filter" type="submit">기간 조회</button>
+            <p class="small alert-title" id="history-period-error" role="alert" hidden></p>
+          </form>
+        </details>
+        <p class="small muted" id="history-range"></p>
+        <p class="small" id="history-message" role="status">활동 기록을 불러오고 있어요.</p>
+        <div id="history-plot" hidden>
+          <svg id="history-chart" viewBox="0 0 320 130" role="img" aria-labelledby="history-chart-title history-chart-description">
+            <title id="history-chart-title">시간에 따른 활동 지표</title>
+            <desc id="history-chart-description">0에서 1 사이의 측정 구간입니다. 관측하지 못한 구간은 표시하지 않습니다.</desc>
+            <g class="history-grid" aria-hidden="true"><path d="M24 10H312M24 60H312M24 110H312"/><text x="0" y="14">1</text><text x="0" y="64">0.5</text><text x="0" y="114">0</text></g>
+            <g id="history-marks"></g>
+          </svg>
+          <div class="history-axis small muted"><span id="history-axis-start"></span><span id="history-axis-end"></span></div>
+          <p class="small muted">지표가 낮을수록 움직임 변화가 작아요. 빈 구간은 관측 기록이 없어요.</p>
+        </div>
+        <button class="button" id="history-more" type="button" hidden>이전 활동 기록 더 보기</button>
+        <details id="history-records" class="period-panel" hidden><summary>최근 조회 기록 · 최대 20개</summary><ul id="history-record-list" class="history-record-list"></ul></details>
+      </section>
     </section>
     <section class="screen" id="events" aria-labelledby="events-title">
       <div class="intro"><div class="section-head"><h1 id="events-title">사건 목록</h1><button class="filter" id="events-refresh" type="button">새로고침</button></div><p class="subtitle">최근 발생 순으로 감지와 처리 기록을 확인하세요.</p></div>
       <div class="filters" role="group" aria-label="사건 유형">
         <button class="filter selected" type="button" data-filter="" aria-pressed="true">전체</button>
         <button class="filter" type="button" data-filter="FALL_SUSPECTED" aria-pressed="false">낙상 의심</button>
-        <button class="filter" type="button" data-filter="NON_RETURN_WARNING" aria-pressed="false">미복귀</button>
+        <button class="filter" type="button" data-filter="LOW_ACTIVITY" aria-pressed="false">저활동</button>
         <button class="filter" type="button" data-filter="FAULT" aria-pressed="false">장애</button>
       </div>
       <details id="event-period-panel" class="period-panel">
@@ -134,6 +174,16 @@
           <button class="button primary" id="ack-button" type="button" disabled>알림 확인</button>
           <p class="small" id="ack-help">확인해도 사건이 해소되지는 않습니다.</p>
         </section>
+        <section class="section low-activity-details" id="detail-low-activity" hidden>
+          <h2>저활동 감지 내용</h2>
+          <dl>
+            <div class="row"><dt>저활동 시작</dt><dd id="detail-low-since">기록 없음</dd></div>
+            <div class="row"><dt>이어진 시간</dt><dd id="detail-low-duration">기록 없음</dd></div>
+            <div class="row"><dt>감지 시간대</dt><dd id="detail-low-schedule">기록 없음</dd></div>
+            <div class="row"><dt>감지 기준</dt><dd id="detail-low-criteria">기록 없음</dd></div>
+            <div class="row"><dt>당시 활동 지표</dt><dd id="detail-low-score">기록 없음</dd></div>
+          </dl>
+        </section>
         <section class="section"><h2>발생과 처리 시각</h2><dl>
           <div class="row"><dt>발생</dt><dd id="detail-occurred">—</dd></div>
           <div class="row"><dt>감지</dt><dd id="detail-detected">—</dd></div>
@@ -166,27 +216,26 @@
         <p class="small muted" id="settings-updated"></p>
       </section>
       <form id="settings-form">
-        <section class="section white" id="bed-alert-settings">
-          <h2 class="with-icon"><svg class="icon" aria-hidden="true"><use href="#i-bed"/></svg>침대 이탈 후 미복귀 감지</h2>
-          <label class="toggle-row" for="bed-monitoring-enabled"><span>감지 사용</span><input class="switch" id="bed-monitoring-enabled" type="checkbox" disabled></label>
-          <label class="field-label" for="bed-monitoring-mode">감지 시간대</label>
-          <select id="bed-monitoring-mode" class="setting-select" disabled><option value="ALL_DAY">상시</option><option value="TIME_RANGE">매일 지정 시간</option></select>
-          <div id="bed-monitoring-times" class="period-dates" hidden>
-            <label for="bed-monitoring-start">시작 시간<input id="bed-monitoring-start" type="time" step="60" disabled></label>
-            <label for="bed-monitoring-end">종료 시간<input id="bed-monitoring-end" type="time" step="60" disabled></label>
+        <section class="section white" id="low-activity-settings">
+          <h2 class="with-icon"><svg class="icon" aria-hidden="true"><use href="#i-low-activity"/></svg>장시간 저활동 감지</h2>
+          <label class="toggle-row" for="low-activity-enabled"><span>감지 사용</span><input class="switch" id="low-activity-enabled" type="checkbox" disabled></label>
+          <label class="field-label" for="low-activity-minutes">저활동 지속 시간</label>
+          <div class="number-field"><input id="low-activity-minutes" type="number" min="1" max="1440" step="1" inputmode="numeric" aria-describedby="low-activity-time-help" required disabled><span>분</span></div>
+          <p class="small muted" id="low-activity-time-help">낮은 활동이 이 시간 이상 이어지면 감지해요. 1~1440분으로 정하세요.</p>
+          <div class="sensitivity-heading"><label class="field-label" for="low-activity-sensitivity">활동 감지 민감도</label><output id="low-activity-sensitivity-value" for="low-activity-sensitivity">2</output></div>
+          <div class="sensitivity-control">
+            <input id="low-activity-sensitivity" type="range" min="0" max="10" step="any" value="2" aria-describedby="low-activity-sensitivity-help" disabled>
+            <div class="sensitivity-ticks" aria-hidden="true"><span>0</span><span>1</span><span>2</span><span>3</span><span>4</span><span>5</span><span>6</span><span>7</span><span>8</span><span>9</span><span>10</span></div>
+            <div class="sensitivity-labels small muted"><span>낮음</span><span>높음</span></div>
           </div>
-          <p class="small muted" id="bed-monitoring-summary">설정을 확인하고 있어요.</p>
-          <label class="field-label" for="non-return-minutes">미복귀 감지 기준</label>
-          <p class="small muted">침대 이탈 후 설정한 시간 동안 복귀하지 않으면 미복귀 상태로 감지해요.</p>
-          <div class="stepper">
-            <button type="button" id="minutes-minus" aria-label="시간 줄이기" disabled>−</button>
-            <div class="stepper-value">
-              <input type="number" id="non-return-minutes" min="1" max="1440" step="1" required disabled>
-              <span id="minutes-unit">분</span>
-            </div>
-            <button type="button" id="minutes-plus" aria-label="시간 늘리기" disabled>+</button>
+          <p class="small muted" id="low-activity-sensitivity-help">높을수록 저활동으로 판단하는 범위가 넓어져요.</p>
+          <label class="field-label" for="low-activity-mode">감지 시간대 · 한국 시간</label>
+          <select id="low-activity-mode" class="schedule-select" disabled><option value="ALL_DAY">상시</option><option value="TIME_RANGE">시간 지정</option></select>
+          <div class="period-dates" id="low-activity-time-fields" hidden>
+            <label for="low-activity-start">시작 시각<input id="low-activity-start" type="time" step="60" value="22:00" disabled></label>
+            <label for="low-activity-end">종료 시각<input id="low-activity-end" type="time" step="60" value="07:00" disabled></label>
           </div>
-          <p class="small muted">1~1440분 범위에서 정할 수 있습니다.</p>
+          <p class="small muted" id="low-activity-schedule-help" hidden>자정을 넘겨 지정할 수 있어요. 감지 시간이 끝나면 이어진 저활동 시간을 초기화해요.</p>
         </section>
         <section class="section white" id="fall-alert-settings">
           <h2 class="with-icon"><svg class="icon" aria-hidden="true"><use href="#i-alert"/></svg>낙상 의심 감지</h2>

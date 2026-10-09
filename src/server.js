@@ -2,6 +2,8 @@ const crypto = require('node:crypto');
 const path = require('node:path');
 const express = require('express');
 const { pool, initializeDatabase, withTransaction } = require('./db');
+const { parseActivity, validLowActivityEvent, validScore, validMinutes } = require('./activity');
+const { historySample, historyQuery, mapSample } = require('./activity-history');
 
 const app = express();
 const projectRoot = path.resolve(__dirname, '..');
@@ -10,10 +12,13 @@ const port = Number(process.env.PORT || 3002);
 const offlineAfterSeconds = 15;
 const validEventTypes = new Set([
   'FALL_SUSPECTED',
-  'NON_RETURN_WARNING',
+  'LOW_ACTIVITY',
   'SENSOR_UNAVAILABLE',
   'GATEWAY_OFFLINE',
 ]);
+
+// Historical non-return events remain queryable; new episodes are retired.
+const readableEventTypes = new Set([...validEventTypes, 'NON_RETURN_WARNING']);
 
 app.disable('x-powered-by');
 app.use(express.json({ limit: '32kb', strict: true }));
@@ -85,14 +90,15 @@ async function getSettings() {
   );
   return {
     version: row.version,
-    nonReturnMinutes: row.non_return_minutes,
-    bedMonitoringEnabled: row.bed_monitoring_enabled,
-    bedMonitoringMode: row.bed_monitoring_mode,
-    bedMonitoringStart: row.bed_monitoring_start.slice(0, 5),
-    bedMonitoringEnd: row.bed_monitoring_end.slice(0, 5),
     fallAlertEnabled: row.fall_alert_enabled,
     sensorFaultAlertEnabled: row.sensor_fault_alert_enabled,
     gatewayFaultAlertEnabled: row.gateway_fault_alert_enabled,
+    lowActivityEnabled: row.low_activity_enabled,
+    lowActivityMinutes: row.low_activity_minutes,
+    lowActivityThreshold: row.low_activity_threshold,
+    lowActivityMode: row.low_activity_mode,
+    lowActivityStart: row.low_activity_start.slice(0, 5),
+    lowActivityEnd: row.low_activity_end.slice(0, 5),
     timeZone: 'Asia/Seoul',
     updatedAt: new Date(row.updated_at).toISOString(),
   };
@@ -106,7 +112,7 @@ app.get('/api/health', async (_req, res) => {
 app.get('/api/status', async (_req, res) => {
   const { rows: [row] } = await pool.query(`SELECT * FROM gateways
     WHERE is_demo = FALSE AND received_at IS NOT NULL
-    ORDER BY received_at DESC LIMIT 1`);
+    ORDER BY received_at DESC, gateway_id DESC LIMIT 1`);
   const settings = await getSettings();
   const now = Date.now();
 
@@ -114,8 +120,7 @@ app.get('/api/status', async (_req, res) => {
     return res.json({
       gateway: { connected: false, receivedAt: null, ageSeconds: null },
       sensor: { available: false, qualityStatus: 'UNKNOWN', measuredAt: null, ageSeconds: null, fresh: false },
-      bedState: 'UNKNOWN',
-      bedExitedAt: null,
+      activity: null,
       settings: { ...settings, appliedVersion: null },
       isDemo: false,
       fetchedAt: new Date(now).toISOString(),
@@ -126,6 +131,9 @@ app.get('/api/status', async (_req, res) => {
     ? Math.max(0, Math.floor((now - new Date(row.received_at).getTime()) / 1000))
     : null;
   const measurementAgeMs = row.measured_at ? now - new Date(row.measured_at).getTime() : null;
+  const observable = ageSeconds !== null && ageSeconds <= offlineAfterSeconds && row.sensor_available &&
+    row.quality_status === 'AVAILABLE' && measurementAgeMs !== null && measurementAgeMs >= -5000 &&
+    measurementAgeMs <= offlineAfterSeconds * 1000;
   return res.json({
     gateway: {
       id: row.gateway_id,
@@ -142,12 +150,39 @@ app.get('/api/status', async (_req, res) => {
       ageSeconds: measurementAgeMs === null ? null : Math.max(0, Math.floor(measurementAgeMs / 1000)),
       fresh: measurementAgeMs !== null && measurementAgeMs >= -5000 && measurementAgeMs <= offlineAfterSeconds * 1000,
     },
-    bedState: row.bed_state,
-    bedExitedAt: row.bed_exited_at ? new Date(row.bed_exited_at).toISOString() : null,
     settings: { ...settings, appliedVersion: row.applied_settings_version },
+    activity: observable ? row.activity_json : null,
     isDemo: row.is_demo,
     fetchedAt: new Date(now).toISOString(),
   });
+});
+
+app.get('/api/activity/history', async (req, res) => {
+  let query;
+  try { query = historyQuery(req.query); }
+  catch (error) { return sendError(res, 400, error.message, '기기·조회 기간(최대 7일)·조회 개수·페이지를 확인해 주세요.'); }
+  if (!query.gatewayId) {
+    const { rows: [latest] } = await pool.query(`SELECT gateway_id FROM gateways
+      WHERE is_demo = FALSE AND received_at IS NOT NULL ORDER BY received_at DESC, gateway_id DESC LIMIT 1`);
+    query.gatewayId = latest?.gateway_id ?? null;
+  }
+  const values = [query.gatewayId, query.from, query.to];
+  let continuation = '';
+  if (query.cursor) {
+    values.push(query.cursor.at, query.cursor.generation, query.cursor.sequence);
+    continuation = 'AND (sampled_at, generation, sequence) < ($4::timestamptz, $5::integer, $6::integer)';
+  }
+  values.push(query.limit + 1);
+  const { rows } = await pool.query(`SELECT * FROM activity_history WHERE gateway_id = $1
+    AND sampled_at >= $2::timestamptz AND sampled_at < $3::timestamptz ${continuation}
+    ORDER BY sampled_at DESC, generation DESC, sequence DESC LIMIT $${values.length}`, values);
+  const items = rows.slice(0, query.limit).map(mapSample);
+  const last = items.at(-1);
+  const nextCursor = rows.length > query.limit ? Buffer.from(JSON.stringify({
+    gatewayId: query.gatewayId, from: query.from, to: query.to,
+    at: last.sampledAt, generation: last.generation, sequence: last.sequence,
+  })).toString('base64url') : null;
+  return res.json({ gatewayId: query.gatewayId, from: query.from, to: query.to, items, nextCursor });
 });
 
 app.get('/api/events', async (req, res) => {
@@ -186,7 +221,7 @@ app.get('/api/events', async (req, res) => {
     if (req.query.type === 'FAULT') {
       clauses.push("event_type IN ('SENSOR_UNAVAILABLE', 'GATEWAY_OFFLINE')");
     } else {
-      if (!validEventTypes.has(req.query.type)) return sendError(res, 400, 'INVALID_TYPE', '지원하지 않는 사건 유형입니다.');
+      if (!readableEventTypes.has(req.query.type)) return sendError(res, 400, 'INVALID_TYPE', '지원하지 않는 사건 유형입니다.');
       values.push(req.query.type);
       clauses.push(`event_type = $${values.length}`);
     }
@@ -287,41 +322,44 @@ app.get('/api/settings', async (_req, res) => res.json(await getSettings()));
 
 app.patch('/api/settings', async (req, res) => {
   const keys = Object.keys(req.body || {});
-  const allowed = ['nonReturnMinutes', 'bedMonitoringEnabled', 'bedMonitoringMode', 'bedMonitoringStart', 'bedMonitoringEnd', 'fallAlertEnabled', 'sensorFaultAlertEnabled', 'gatewayFaultAlertEnabled'];
+  const allowed = ['fallAlertEnabled', 'sensorFaultAlertEnabled', 'gatewayFaultAlertEnabled',
+    'lowActivityEnabled', 'lowActivityMinutes', 'lowActivityThreshold',
+    'lowActivityMode', 'lowActivityStart', 'lowActivityEnd'];
   if (!keys.length || keys.some((key) => !allowed.includes(key))) {
     return sendError(res, 400, 'INVALID_SETTINGS', '변경할 수 없는 설정이 포함됐습니다.');
   }
   const patch = req.body;
-  if (['fallAlertEnabled', 'sensorFaultAlertEnabled', 'gatewayFaultAlertEnabled'].some((key) => keys.includes(key) && typeof patch[key] !== 'boolean')) {
+  if (['fallAlertEnabled', 'sensorFaultAlertEnabled', 'gatewayFaultAlertEnabled', 'lowActivityEnabled'].some((key) => keys.includes(key) && typeof patch[key] !== 'boolean')) {
     return sendError(res, 400, 'INVALID_ALERT_OPTIONS', '감지 사용 여부는 켜기 또는 끄기로 지정해 주세요.');
   }
-  if (keys.includes('nonReturnMinutes') && (!Number.isInteger(patch.nonReturnMinutes) || patch.nonReturnMinutes < 1 || patch.nonReturnMinutes > 1440)) {
-    return sendError(res, 400, 'INVALID_NON_RETURN_MINUTES', '미복귀 기준은 1~1440분 정수여야 합니다.');
+  if ((keys.includes('lowActivityMinutes') && !validMinutes(patch.lowActivityMinutes)) ||
+      (keys.includes('lowActivityThreshold') && !validScore(patch.lowActivityThreshold))) {
+    return sendError(res, 400, 'INVALID_LOW_ACTIVITY_SETTINGS', '저활동 기준은 1~1440분 정수와 0~1 활동 지표로 지정해 주세요.');
   }
-  const validTime = (value) => typeof value === 'string' && /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(value);
-  if ((keys.includes('bedMonitoringEnabled') && typeof patch.bedMonitoringEnabled !== 'boolean') ||
-      (keys.includes('bedMonitoringMode') && !['ALL_DAY', 'TIME_RANGE'].includes(patch.bedMonitoringMode)) ||
-      (keys.includes('bedMonitoringStart') && !validTime(patch.bedMonitoringStart)) ||
-      (keys.includes('bedMonitoringEnd') && !validTime(patch.bedMonitoringEnd))) {
-    return sendError(res, 400, 'INVALID_BED_MONITORING', '감지 시간대 설정을 확인해 주세요.');
+  const validTime = value => typeof value === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(value);
+  if ((keys.includes('lowActivityMode') && !['ALL_DAY', 'TIME_RANGE'].includes(patch.lowActivityMode)) ||
+      ['lowActivityStart', 'lowActivityEnd'].some(key => keys.includes(key) && !validTime(patch[key]))) {
+    return sendError(res, 400, 'INVALID_LOW_ACTIVITY_SCHEDULE', '감지 시간대와 시작·종료 시각(HH:mm)을 확인해 주세요.');
   }
-  const result = await withTransaction(async (client) => {
+  const saved = await withTransaction(async (client) => {
     const { rows: [current] } = await client.query('SELECT * FROM settings WHERE singleton_id = 1 FOR UPDATE');
-    const enabled = patch.bedMonitoringEnabled ?? current.bed_monitoring_enabled;
-    const mode = patch.bedMonitoringMode ?? current.bed_monitoring_mode;
-    const start = patch.bedMonitoringStart ?? current.bed_monitoring_start.slice(0, 5);
-    const end = patch.bedMonitoringEnd ?? current.bed_monitoring_end.slice(0, 5);
-    if (enabled && mode === 'TIME_RANGE' && start === end) return false;
-    await client.query(`UPDATE settings SET non_return_minutes = $1, bed_monitoring_enabled = $2,
-      bed_monitoring_mode = $3, bed_monitoring_start = $4, bed_monitoring_end = $5,
-      fall_alert_enabled = $6, sensor_fault_alert_enabled = $7, gateway_fault_alert_enabled = $8,
+    const start = patch.lowActivityStart ?? current.low_activity_start.slice(0, 5);
+    const end = patch.lowActivityEnd ?? current.low_activity_end.slice(0, 5);
+    if (start === end) return false;
+    await client.query(`UPDATE settings SET
+      fall_alert_enabled = $1, sensor_fault_alert_enabled = $2, gateway_fault_alert_enabled = $3,
+      low_activity_enabled = $4, low_activity_minutes = $5, low_activity_threshold = $6,
+      low_activity_mode = $7, low_activity_start = $8::time, low_activity_end = $9::time,
       version = version + 1, updated_at = NOW() WHERE singleton_id = 1`,
-    [patch.nonReturnMinutes ?? current.non_return_minutes, enabled, mode, start, end,
-      patch.fallAlertEnabled ?? current.fall_alert_enabled, patch.sensorFaultAlertEnabled ?? current.sensor_fault_alert_enabled,
-      patch.gatewayFaultAlertEnabled ?? current.gateway_fault_alert_enabled]);
+    [patch.fallAlertEnabled ?? current.fall_alert_enabled,
+      patch.sensorFaultAlertEnabled ?? current.sensor_fault_alert_enabled,
+      patch.gatewayFaultAlertEnabled ?? current.gateway_fault_alert_enabled,
+      patch.lowActivityEnabled ?? current.low_activity_enabled, patch.lowActivityMinutes ?? current.low_activity_minutes,
+      patch.lowActivityThreshold ?? current.low_activity_threshold,
+      patch.lowActivityMode ?? current.low_activity_mode, start, end]);
     return true;
   });
-  if (!result) return sendError(res, 400, 'INVALID_BED_MONITORING', '시작과 종료 시간이 같으면 상시를 선택해 주세요.');
+  if (!saved) return sendError(res, 400, 'INVALID_LOW_ACTIVITY_SCHEDULE', '시작 시각과 종료 시각은 다르게 지정해 주세요. 상시 감지는 상시를 선택하세요.');
   return res.json(await getSettings());
 });
 
@@ -330,41 +368,49 @@ app.get('/api/gateway/settings', requireGatewayToken, async (_req, res) => res.j
 app.post('/api/ingest/status', requireGatewayToken, async (req, res) => {
   const body = req.body || {};
   const qualityStatuses = new Set(['AVAILABLE', 'DEGRADED', 'UNAVAILABLE', 'UNKNOWN']);
-  const bedStates = new Set(['IN_BED', 'OUT_OF_BED', 'UNKNOWN']);
+  const activity = parseActivity(body);
+  if (activity === false) return sendError(res, 400, 'INVALID_ACTIVITY', '활동 지표·측정 구간·출처·버전을 확인해 주세요.');
 
   if (!validIdentifier(body.gatewayId) || !Number.isSafeInteger(body.generation) || body.generation < 1 || body.generation > 2147483647 ||
       !Number.isSafeInteger(body.sequence) || body.sequence < 0 || body.sequence > 2147483647 || typeof body.sensorAvailable !== 'boolean' ||
-      !qualityStatuses.has(body.qualityStatus) || !bedStates.has(body.bedState) ||
+      !qualityStatuses.has(body.qualityStatus) ||
       (body.measuredAt !== null && !validTimestamp(body.measuredAt)) ||
       (body.isDemo !== undefined && typeof body.isDemo !== 'boolean') ||
-      (body.bedExitedAt !== undefined && body.bedExitedAt !== null && !validTimestamp(body.bedExitedAt)) ||
       (body.appliedSettingsVersion !== undefined && body.appliedSettingsVersion !== null &&
         (!Number.isInteger(body.appliedSettingsVersion) || body.appliedSettingsVersion < 1 || body.appliedSettingsVersion > 2147483647))) {
     return sendError(res, 400, 'INVALID_STATUS', '상태 필드 또는 값이 올바르지 않습니다.');
   }
 
-  const receivedAt = new Date();
-  const { rows } = await pool.query(`
-    INSERT INTO gateways (gateway_id, generation, sequence, sensor_available, quality_status, bed_state, measured_at, received_at, is_demo, bed_exited_at, applied_settings_version)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-    ON CONFLICT (gateway_id) DO UPDATE SET generation = EXCLUDED.generation, sequence = EXCLUDED.sequence,
-      sensor_available = EXCLUDED.sensor_available, quality_status = EXCLUDED.quality_status,
-      bed_state = EXCLUDED.bed_state, measured_at = EXCLUDED.measured_at,
-      received_at = EXCLUDED.received_at, is_demo = EXCLUDED.is_demo,
-      bed_exited_at = EXCLUDED.bed_exited_at, applied_settings_version = EXCLUDED.applied_settings_version
-    WHERE EXCLUDED.generation > gateways.generation
-      OR (EXCLUDED.generation = gateways.generation AND EXCLUDED.sequence > gateways.sequence)
-    RETURNING gateway_id
-  `, [body.gatewayId, body.generation, body.sequence, body.sensorAvailable, body.qualityStatus,
-    body.bedState, body.measuredAt || null, receivedAt, body.isDemo ?? false,
-    body.bedState === 'OUT_OF_BED' ? body.bedExitedAt ?? null : null, body.appliedSettingsVersion ?? null]);
-  if (!rows.length) return sendError(res, 409, 'STALE_STATUS', '이전 세대 또는 순번의 상태입니다.');
+  const receivedAt = await withTransaction(async client => {
+    await client.query('INSERT INTO gateways (gateway_id) VALUES ($1) ON CONFLICT (gateway_id) DO NOTHING', [body.gatewayId]);
+    const { rows: [previous] } = await client.query('SELECT * FROM gateways WHERE gateway_id = $1 FOR UPDATE', [body.gatewayId]);
+    if (body.generation < previous.generation || (body.generation === previous.generation && body.sequence <= previous.sequence)) return null;
+    const received = new Date();
+    const sample = historySample(body, activity, previous, received);
+    const currentActivity = body.sensorAvailable && body.qualityStatus === 'AVAILABLE' && activity && (!sample || !sample.reason) ? activity : null;
+    await client.query(`UPDATE gateways SET generation=$2, sequence=$3, sensor_available=$4, quality_status=$5,
+      measured_at=$6, received_at=$7, is_demo=$8, applied_settings_version=$9, activity_json=$10::jsonb,
+      activity_watermark_at=$11 WHERE gateway_id=$1`, [body.gatewayId, body.generation, body.sequence,
+      body.sensorAvailable, body.qualityStatus, body.measuredAt || null, received, body.isDemo ?? false,
+      body.appliedSettingsVersion ?? null, currentActivity ? JSON.stringify(currentActivity) : null,
+      sample ? sample.watermark : body.generation === previous.generation ? previous.activity_watermark_at : null]);
+    if (sample) await client.query(`INSERT INTO activity_history
+      (gateway_id,generation,sequence,sampled_at,measured_at,received_at,window_started_at,score,quality_status,model_version,calibration_version,reason)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`, [body.gatewayId, body.generation, body.sequence,
+      sample.sampledAt, body.measuredAt || null, received, activity?.windowStartedAt ?? null, sample.score,
+      body.qualityStatus, activity?.modelVersion ?? null, activity?.calibrationVersion ?? null, sample.reason]);
+    return received;
+  });
+  if (!receivedAt) return sendError(res, 409, 'STALE_STATUS', '이전 세대 또는 순번의 상태입니다.');
   return res.status(202).json({ accepted: true, receivedAt: receivedAt.toISOString() });
 });
 
 app.post('/api/ingest/events', requireGatewayToken, async (req, res) => {
   const body = req.body || {};
-  if (!validIdentifier(body.eventId) || !validIdentifier(body.gatewayId) || !validEventTypes.has(body.type) ||
+  if (body.type === 'LOW_ACTIVITY' && !validLowActivityEvent(body)) {
+    return sendError(res, 400, 'INVALID_LOW_ACTIVITY_EVENT', '저활동 사건의 관측 시간·활동 지표·기준·출처를 확인해 주세요.');
+  }
+  if (!validIdentifier(body.eventId) || !validIdentifier(body.gatewayId) || !readableEventTypes.has(body.type) ||
       !validTimestamp(body.occurredAt) || !validTimestamp(body.detectedAt)) {
     return sendError(res, 400, 'INVALID_EVENT', '사건 필수 필드 또는 값이 올바르지 않습니다.');
   }
@@ -390,6 +436,17 @@ app.post('/api/ingest/events', requireGatewayToken, async (req, res) => {
     details: body.details && typeof body.details === 'object' && !Array.isArray(body.details) ? body.details : {},
     isDemo: body.isDemo ?? false,
   };
+
+  if (!validEventTypes.has(payload.type)) {
+    const { rows: [previous] } = await pool.query(
+      'SELECT payload_json FROM events WHERE event_id = $1', [payload.eventId],
+    );
+    if (!previous) return sendError(res, 400, 'RETIRED_EVENT_TYPE', '더 이상 새로 생성하지 않는 사건 유형입니다.');
+    if (stableJson(previous.payload_json) !== stableJson(payload)) {
+      return sendError(res, 409, 'EVENT_ID_CONFLICT', '같은 eventId에 다른 내용이 전달되었습니다.');
+    }
+    return res.json({ accepted: true, duplicate: true, eventId: payload.eventId });
+  }
 
   const result = await withTransaction(async (client) => {
     await client.query(`INSERT INTO gateways (gateway_id) VALUES ($1)
