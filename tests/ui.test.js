@@ -7,6 +7,7 @@ const { JSDOM } = require('jsdom');
 const root = path.resolve(__dirname, '..');
 const html = fs.readFileSync(path.join(root, 'public/index.html'), 'utf8');
 const app = fs.readFileSync(path.join(root, 'public/app.js'), 'utf8');
+const historyApp = fs.readFileSync(path.join(root, 'public/activity-history.js'), 'utf8');
 const css = fs.readFileSync(path.join(root, 'public/styles.css'), 'utf8');
 const timestamp = '2026-10-06T12:00:00.000Z';
 const baseEvent = { eventId: 'test-a', gatewayId: 'demo', type: 'FALL_SUSPECTED', state: 'OPEN', occurredAt: timestamp, detectedAt: timestamp, receivedAt: timestamp, isDemo: true, actions: [] };
@@ -29,21 +30,416 @@ function mount(overrides = {}) {
       const result = await overrides.fetch(path, options);
       if (result) return result;
     }
-    if (path === '/api/status') return response({ gateway: { connected: false, receivedAt: timestamp, ageSeconds: 60 }, sensor: { available: true, qualityStatus: 'AVAILABLE', measuredAt: timestamp }, bedState: 'IN_BED', isDemo: true, fetchedAt: timestamp });
-    if (path === '/api/settings') return response({ version: 1, nonReturnMinutes: 10, updatedAt: timestamp });
+    if (path === '/api/status') return response({ gateway: { connected: false, receivedAt: timestamp, ageSeconds: 60 }, sensor: { available: true, qualityStatus: 'AVAILABLE', measuredAt: timestamp }, isDemo: true, fetchedAt: timestamp });
+    if (path === '/api/settings') return response({ version: 1, updatedAt: timestamp });
+    if (path.startsWith('/api/activity/history?')) {
+      const params = new URL(path, 'http://localhost').searchParams;
+      return response({ gatewayId: null, from: params.get('from'), to: params.get('to'), items: [], nextCursor: null });
+    }
     if (path.startsWith('/api/events?')) return response({ items: [baseEvent], nextCursor: null });
     if (path === '/api/events/test-a') return response(baseEvent);
     throw new Error(`Unmocked request ${path}`);
   };
   dom.window.eval(app);
+  dom.window.eval(historyApp);
   return { dom, document: dom.window.document, calls, timers };
 }
 
-test('stale heartbeat never shows current bed occupancy or developer-only copy', async () => {
+function activityStatus(overrides = {}) {
+  const measuredAt = new Date().toISOString();
+  return { isDemo: false, gateway: { connected: true, receivedAt: measuredAt },
+    sensor: { available: true, qualityStatus: 'AVAILABLE', measuredAt, fresh: true },
+    activity: { score: 0.1, windowStartedAt: new Date(Date.parse(measuredAt) - 10000).toISOString(),
+      modelVersion: 'activity-v1', calibrationVersion: 'room-v1' },
+    settings: { version: 1, appliedVersion: 1, updatedAt: measuredAt,
+      lowActivityEnabled: true, lowActivityMinutes: 30, lowActivityThreshold: 0.2 },
+    ...overrides };
+}
+
+function historyResponse(path, items = [], nextCursor = null) {
+  const params = new URL(path, 'http://localhost').searchParams;
+  return response({ gatewayId: 'room-history', from: params.get('from'), to: params.get('to'), items, nextCursor });
+}
+function historyItem(sequence, score, reason = null) {
+  const end = Date.now() - sequence * 10000;
+  return { generation: 1, sequence, sampledAt: new Date(end).toISOString(),
+    windowStartedAt: new Date(end - 5000).toISOString(), score, reason };
+}
+
+test('activity history draws separate measured windows including zero, with gaps and accessible records', async () => {
+  const items = [historyItem(1, 0), historyItem(2, null, 'SENSING_UNAVAILABLE'), historyItem(3, 0.8)];
+  const { dom, document } = mount({ fetch: async path => path.startsWith('/api/activity/history?') ? historyResponse(path, items) : undefined });
+  try {
+    await settle();
+    assert.equal(document.getElementById('history-plot').hidden, false);
+    const marks = document.querySelectorAll('#history-marks line');
+    assert.equal(marks.length, 2); assert.equal(marks[0].getAttribute('y1'), '110');
+    assert.equal(document.querySelectorAll('#history-marks path, #history-marks polyline').length, 0, 'no interpolation across gaps');
+    assert.match(document.getElementById('history-message').textContent, /측정 2개 · 관측 불가 1개/);
+    assert.match(document.getElementById('history-record-list').textContent, /관측 불가/);
+    assert.match(document.getElementById('history-axis-end').textContent, /\d{2}:\d{2}:\d{2}$/);
+    assert.equal(document.getElementById('history-period-panel').open, false);
+  } finally { dom.window.close(); }
+});
+
+test('activity history presets and custom dates send bounded local minute-inclusive periods', async () => {
+  const { dom, document, calls } = mount();
+  try {
+    await settle();
+    for (const hours of [6, 24, 1]) {
+      document.querySelector(`[data-history-hours="${hours}"]`).click(); await settle();
+      const params = new URL(calls.at(-1).path, 'http://localhost').searchParams;
+      assert.equal(Date.parse(params.get('to')) - Date.parse(params.get('from')), hours * 3600000);
+    }
+    const submit = async () => { document.getElementById('history-period-form').dispatchEvent(new dom.window.Event('submit', { cancelable: true })); await settle(); };
+    const before = calls.length;
+    await submit(); assert.equal(calls.length, before);
+    document.getElementById('history-start-date').value = '2026-10-08';
+    document.getElementById('history-end-date').value = '2026-10-08';
+    document.getElementById('history-start-time').value = '09:00';
+    document.getElementById('history-end-time').value = '10:00'; await submit();
+    const params = new URL(calls.at(-1).path, 'http://localhost').searchParams;
+    assert.equal(params.get('from'), new Date('2026-10-08T09:00:00').toISOString());
+    assert.equal(params.get('to'), new Date('2026-10-08T10:01:00').toISOString());
+    assert.equal(document.querySelector('[data-history-hours="1"]').getAttribute('aria-pressed'), 'false');
+    let count = calls.length;
+    document.getElementById('history-start-date').value = '2026-10-09'; await submit(); assert.equal(calls.length, count);
+    document.getElementById('history-start-date').value = '2026-09-01'; await submit(); assert.equal(calls.length, count);
+    assert.match(document.getElementById('history-period-error').textContent, /7일/);
+  } finally { dom.window.close(); }
+});
+
+test('activity history distinguishes no records, unavailable observations and query failure', async () => {
+  let phase = 'empty';
+  const { dom, document } = mount({ fetch: async path => {
+    if (!path.startsWith('/api/activity/history?')) return;
+    if (phase === 'failed') return response({}, 500);
+    return historyResponse(path, phase === 'empty' ? [] : [historyItem(1, null, 'NO_ACTIVITY')]);
+  } });
+  try {
+    await settle(); assert.match(document.getElementById('history-message').textContent, /기록이 없어요/);
+    phase = 'gap'; document.getElementById('history-refresh').click(); await settle();
+    assert.match(document.getElementById('history-message').textContent, /측정 0개 · 관측 불가 1개/);
+    assert.equal(document.getElementById('history-plot').hidden, true);
+    phase = 'failed'; document.getElementById('history-refresh').click(); await settle();
+    assert.match(document.getElementById('history-message').textContent, /불러오지 못/);
+    assert.equal(document.getElementById('history-records').hidden, true);
+  } finally { dom.window.close(); }
+});
+
+test('history pagination pins scope, retries failures and merges records without duplicates', async () => {
+  const item = historyItem(1, 0.4);
+  let fail = true;
+  const { dom, document, calls } = mount({ fetch: async path => {
+    if (!path.startsWith('/api/activity/history?')) return;
+    const params = new URL(path, 'http://localhost').searchParams;
+    if (!params.has('cursor')) return historyResponse(path, [item], 'next-page');
+    if (fail) return response({}, 500);
+    return historyResponse(path, [item, historyItem(2, 0.1)]);
+  } });
+  try {
+    await settle(); assert.equal(document.getElementById('history-more').hidden, false);
+    document.getElementById('history-more').click(); await settle();
+    assert.equal(document.querySelectorAll('#history-marks line').length, 1, 'append failure keeps existing data');
+    assert.match(document.getElementById('history-message').textContent, /다시 시도/);
+    fail = false; document.getElementById('history-more').click(); await settle();
+    const params = new URL(calls.at(-1).path, 'http://localhost').searchParams;
+    assert.equal(params.get('gatewayId'), 'room-history'); assert.equal(params.get('cursor'), 'next-page');
+    assert.equal(document.querySelectorAll('#history-marks line').length, 2);
+    assert.equal(document.getElementById('history-more').hidden, true);
+  } finally { dom.window.close(); }
+});
+
+test('late history response cannot replace a newer period and automatic refresh respects custom periods', async () => {
+  let resolveFirst;
+  let count = 0;
+  const { dom, document, calls, timers } = mount({ fetch: async path => {
+    if (!path.startsWith('/api/activity/history?')) return;
+    if (++count === 1) return new Promise(resolve => { resolveFirst = () => resolve(historyResponse(path, [historyItem(1, 0.9)])); });
+    return historyResponse(path, [historyItem(2, 0.2)]);
+  } });
+  try {
+    await settle(); document.querySelector('[data-history-hours="6"]').click(); await settle();
+    resolveFirst(); await settle();
+    assert.match(document.getElementById('history-record-list').textContent, /0.2$/);
+    assert.doesNotMatch(document.getElementById('history-record-list').textContent, /0.9/);
+    const before = calls.filter(call => call.path.startsWith('/api/activity/history?')).length;
+    await timers[1](); await settle();
+    assert.equal(calls.filter(call => call.path.startsWith('/api/activity/history?')).length, before + 1);
+    document.getElementById('history-start-date').value = document.getElementById('history-end-date').value = '2026-10-08';
+    document.getElementById('history-period-form').dispatchEvent(new dom.window.Event('submit', { cancelable: true })); await settle();
+    const customCount = calls.length; await timers[1](); await settle(); assert.equal(calls.length, customCount);
+  } finally { dom.window.close(); }
+});
+
+test('current activity displays valid zero, hides invalid or demo inputs, and clears after a failed query', async () => {
+  let status = activityStatus();
+  let failed = false;
+  const { dom, document, timers } = mount({ fetch: async path => {
+    if (path === '/api/status') return failed ? response({ error: { message: 'offline' } }, 500) : response(status);
+  } });
+  try {
+    await settle();
+    assert.equal(document.getElementById('activity-score').textContent, '0.10');
+    assert.equal(document.getElementById('activity-state').textContent, '낮은 활동');
+    assert.equal(document.getElementById('activity-meter').hidden, false);
+    assert.match(document.getElementById('activity-measured-at').textContent, /\d{2}:\d{2}:\d{2}$/);
+    status = activityStatus(); status.activity.score = 0; await timers[0]();
+    assert.equal(document.getElementById('activity-score').textContent, '0.00');
+    assert.equal(document.getElementById('activity-meter').getAttribute('aria-valuetext'), '0.00');
+    status.activity.score = 0.20001; await timers[0]();
+    assert.equal(document.getElementById('activity-score').textContent, '0.20001');
+    assert.equal(document.getElementById('activity-state').textContent, '활동 변화');
+    for (const patch of [{ isDemo: true }, { isDemo: undefined }, { activity: null },
+      { gateway: { connected: false } }, { sensor: { ...status.sensor, fresh: false } },
+      { sensor: { ...status.sensor, qualityStatus: 'DEGRADED' } },
+      { activity: { ...status.activity, score: null } }, { activity: { ...status.activity, score: '0.1' } },
+      { activity: { ...status.activity, modelVersion: '' } }, { activity: { ...status.activity, calibrationVersion: null } },
+      { sensor: { ...status.sensor, measuredAt: '2026-01-01T00:00:00.000Z' } }]) {
+      status = { ...activityStatus(), ...patch }; await timers[0]();
+      assert.equal(document.getElementById('activity-score').textContent, '—');
+      assert.equal(document.getElementById('activity-state').textContent, '확인 불가');
+      assert.equal(document.getElementById('activity-meter').hidden, true);
+      assert.equal(document.getElementById('activity-measured-at').textContent, '기록 없음');
+    }
+    status = activityStatus(); await timers[0]();
+    assert.equal(document.getElementById('activity-score').textContent, '0.10');
+    failed = true; await timers[0]();
+    assert.equal(document.getElementById('activity-meter').hidden, true);
+    assert.equal(document.getElementById('activity-score').textContent, '—');
+  } finally { dom.window.close(); }
+});
+
+test('current activity uses only a confirmed applied criterion and never claims prolonged inactivity', async () => {
+  let status = activityStatus();
+  status.activity.score = 0.4;
+  const { dom, document, timers } = mount({ fetch: async path => path === '/api/status' ? response(status) : undefined });
+  try {
+    await settle();
+    assert.equal(document.getElementById('activity-state').textContent, '활동 변화');
+    status.settings = { ...status.settings, version: 2, lowActivityThreshold: 0.5 }; await timers[0]();
+    assert.equal(document.getElementById('activity-state').textContent, '측정됨');
+    assert.match(document.getElementById('activity-help').textContent, /기기 적용/);
+    status.settings.appliedVersion = 2; await timers[0]();
+    assert.equal(document.getElementById('activity-state').textContent, '낮은 활동');
+    assert.doesNotMatch(document.getElementById('activity-summary').textContent, /정상|안전|30분 경과|장시간 저활동 발생/);
+  } finally { dom.window.close(); }
+});
+
+test('low activity settings preserve edits through polling and failed saves then save all options together', async () => {
+  let settings = activityStatus().settings;
+  let failSave = true;
+  const { dom, document, calls, timers } = mount({ fetch: async (path, options) => {
+    if (path === '/api/status') return response(activityStatus({ settings }));
+    if (path === '/api/settings' && options.method === 'PATCH') {
+      if (failSave) return response({ error: { message: 'save failed' } }, 500);
+      settings = { ...settings, ...JSON.parse(options.body), version: settings.version + 1 };
+      return response(settings);
+    }
+  } });
+  try {
+    await settle();
+    const minutes = document.getElementById('low-activity-minutes');
+    const threshold = document.getElementById('low-activity-sensitivity');
+    const form = document.getElementById('settings-form');
+    assert.equal(minutes.disabled, false);
+    minutes.value = '45'; minutes.dispatchEvent(new dom.window.Event('input'));
+    threshold.value = '3'; threshold.dispatchEvent(new dom.window.Event('input'));
+    await timers[0]();
+    assert.equal(minutes.value, '45'); assert.equal(threshold.value, '3');
+    assert.equal(document.getElementById('settings-unsaved').hidden, false);
+    form.dispatchEvent(new dom.window.Event('submit', { cancelable: true })); await settle();
+    assert.equal(minutes.value, '45'); assert.equal(threshold.value, '3');
+    assert.match(document.getElementById('settings-message').textContent, /저장하지 못/);
+    assert.equal(document.getElementById('low-activity-enabled').disabled, false);
+    failSave = false;
+    form.dispatchEvent(new dom.window.Event('submit', { cancelable: true })); await settle();
+    const saved = JSON.parse(calls.filter(call => call.method === 'PATCH').at(-1).body);
+    assert.deepEqual(saved, { lowActivityEnabled: true, lowActivityMinutes: 45, lowActivityThreshold: 0.3,
+      lowActivityMode: 'ALL_DAY', lowActivityStart: '22:00', lowActivityEnd: '07:00',
+      fallAlertEnabled: true, sensorFaultAlertEnabled: true, gatewayFaultAlertEnabled: true });
+    assert.equal(document.getElementById('settings-unsaved').hidden, true);
+    assert.match(document.querySelector('#settings-alerts .detection-chip').textContent, /장시간 저활동 감지 켜짐.*45분.*민감도 3.*상시/);
+    assert.equal(document.getElementById('settings-application').textContent, '적용 확인 중');
+  } finally { dom.window.close(); }
+});
+
+test('low activity disabled fields can be cleared without blocking switch-off, and enabled values are validated', async () => {
+  let settings = activityStatus().settings;
+  const { dom, document, calls } = mount({ fetch: async (path, options) => {
+    if (path === '/api/status') return response(activityStatus({ settings }));
+    if (path === '/api/settings' && options.method === 'PATCH') {
+      settings = { ...settings, ...JSON.parse(options.body), version: settings.version + 1 };
+      return response(settings);
+    }
+  } });
+  try {
+    await settle();
+    const enabled = document.getElementById('low-activity-enabled');
+    const minutes = document.getElementById('low-activity-minutes');
+    const threshold = document.getElementById('low-activity-sensitivity');
+    const submit = async () => { document.getElementById('settings-form').dispatchEvent(new dom.window.Event('submit', { cancelable: true })); await settle(); };
+    minutes.value = ''; threshold.value = '';
+    enabled.checked = false; enabled.dispatchEvent(new dom.window.Event('change'));
+    assert.equal(minutes.disabled, true); assert.equal(threshold.required, false);
+    await submit();
+    assert.equal(settings.lowActivityEnabled, false);
+    assert.equal(settings.lowActivityMinutes, 30); assert.equal(settings.lowActivityThreshold, 0.2);
+    enabled.checked = true; enabled.dispatchEvent(new dom.window.Event('change'));
+    for (const timeValue of ['', '0', '1441', '1.5']) {
+      minutes.value = timeValue;
+      const before = calls.filter(call => call.method === 'PATCH').length;
+      await submit();
+      assert.equal(calls.filter(call => call.method === 'PATCH').length, before);
+      assert.equal(document.getElementById('settings-message').hidden, false);
+    }
+    minutes.value = '1440'; threshold.value = '0'; threshold.dispatchEvent(new dom.window.Event('input')); await submit();
+    assert.equal(settings.lowActivityMinutes, 1440); assert.equal(settings.lowActivityThreshold, 0);
+    threshold.value = '10'; threshold.dispatchEvent(new dom.window.Event('input')); await submit();
+    assert.equal(settings.lowActivityThreshold, 1);
+  } finally { dom.window.close(); }
+});
+
+test('low activity filter composes with period/state and detail evidence survives acknowledgement and resolution', async () => {
+  let current = { ...baseEvent, eventId: 'test-low', type: 'LOW_ACTIVITY',
+    details: { lowSince: '2026-10-06T11:29:59.000Z', durationSeconds: 1801,
+      thresholdMinutes: 30, activityThreshold: 0.2, activityScore: 0.08,
+      monitoringMode: 'TIME_RANGE', monitoringStart: '22:00', monitoringEnd: '07:00' } };
+  const { dom, document, calls } = mount({ fetch: async (path, options) => {
+    if (path.startsWith('/api/events?')) return response({ items: [current], nextCursor: null });
+    if (path === '/api/events/test-low') return response(current);
+    if (path.endsWith('/ack')) { current = { ...current, state: 'ACKNOWLEDGED', acknowledgedAt: timestamp }; return response({ item: current }); }
+    if (path.endsWith('/resolve')) { current = { ...current, state: 'RESOLVED', resolvedAt: timestamp, resolutionReason: JSON.parse(options.body).reason }; return response({ item: current }); }
+  } });
+  try {
+    await settle();
+    const filter = document.querySelector('[data-filter="LOW_ACTIVITY"]'); filter.click(); await settle();
+    assert.equal(filter.getAttribute('aria-pressed'), 'true');
+    const state = document.getElementById('event-state-filter'); state.value = 'OPEN'; state.dispatchEvent(new dom.window.Event('change')); await settle();
+    document.getElementById('event-start-date').value = '2026-10-06';
+    document.getElementById('event-period-form').dispatchEvent(new dom.window.Event('submit', { cancelable: true })); await settle();
+    let query = calls.filter(call => call.path.startsWith('/api/events?')).at(-1).path;
+    assert.match(query, /type=LOW_ACTIVITY/); assert.match(query, /state=OPEN/); assert.match(query, /from=/);
+    document.querySelector('#events-list a').click(); await settle();
+    assert.equal(document.getElementById('detail-low-activity').hidden, false);
+    assert.equal(document.getElementById('detail-type').textContent, '장시간 저활동');
+    assert.equal(document.getElementById('detail-low-duration').textContent, '30분 1초');
+    assert.match(document.getElementById('detail-low-criteria').textContent, /30분.*민감도 2/);
+    assert.equal(document.getElementById('detail-low-schedule').textContent, '22:00~07:00 (한국 시간)');
+    assert.equal(document.querySelector('#detail-icon use').getAttribute('href'), '#i-low-activity');
+    assert.equal(document.querySelector('#events-list .icon use').getAttribute('href'), '#i-low-activity');
+    assert.equal(document.getElementById('detail-low-score').textContent, '0.08');
+    document.getElementById('ack-button').click(); await settle();
+    assert.equal(document.getElementById('detail-state').textContent, '확인됨');
+    assert.equal(document.getElementById('detail-low-duration').textContent, '30분 1초');
+    document.getElementById('observed').checked = true;
+    document.getElementById('reason').value = '직접 대화하고 움직임을 확인했습니다.';
+    document.getElementById('reason').dispatchEvent(new dom.window.Event('input'));
+    document.getElementById('resolve-form').dispatchEvent(new dom.window.Event('submit', { cancelable: true })); await settle();
+    assert.equal(document.getElementById('detail-state').textContent, '해소됨');
+    assert.equal(document.getElementById('detail-low-activity').hidden, false);
+    dom.window.history.replaceState({}, '', '?eventId=test-a#detail');
+    dom.window.dispatchEvent(new dom.window.PopStateEvent('popstate')); await settle();
+    assert.equal(document.getElementById('detail-low-activity').hidden, true);
+  } finally { dom.window.close(); }
+});
+
+test('sensitivity scale preserves a precise saved threshold until moved and then snaps to 0 through 10', async () => {
+  let settings = { ...activityStatus().settings, lowActivityThreshold: 0.150001 };
+  const { dom, document, calls } = mount({ fetch: async (path, options) => {
+    if (path === '/api/status') return response(activityStatus({ settings }));
+    if (path === '/api/settings' && options.method === 'PATCH') {
+      settings = { ...settings, ...JSON.parse(options.body), version: settings.version + 1 }; return response(settings);
+    }
+  } });
+  try {
+    await settle();
+    const slider = document.getElementById('low-activity-sensitivity');
+    assert.equal(slider.type, 'range'); assert.equal(slider.min, '0'); assert.equal(slider.max, '10');
+    assert.equal(document.querySelectorAll('.sensitivity-ticks span').length, 11);
+    assert.equal(document.getElementById('low-activity-sensitivity-value').textContent, '1.50001');
+    assert.equal(document.getElementById('settings-unsaved').hidden, true);
+    document.getElementById('settings-form').dispatchEvent(new dom.window.Event('submit', { cancelable: true })); await settle();
+    assert.equal(JSON.parse(calls.filter(call => call.method === 'PATCH').at(-1).body).lowActivityThreshold, 0.150001);
+    slider.value = '3.7'; slider.dispatchEvent(new dom.window.Event('input'));
+    assert.equal(slider.value, '4'); assert.equal(document.getElementById('low-activity-sensitivity-value').textContent, '4');
+    assert.match(slider.getAttribute('aria-valuetext'), /민감도 4/);
+    document.getElementById('settings-form').dispatchEvent(new dom.window.Event('submit', { cancelable: true })); await settle();
+    assert.equal(settings.lowActivityThreshold, 0.4);
+    assert.equal(document.querySelector('#low-activity-settings h2 use').getAttribute('href'), '#i-low-activity');
+  } finally { dom.window.close(); }
+});
+
+test('low activity schedule hides all-day times and preserves overnight edits through polling and failed saves', async () => {
+  let settings = { ...activityStatus().settings, lowActivityMode: 'ALL_DAY', lowActivityStart: '22:00', lowActivityEnd: '07:00' };
+  let fail = true;
+  const { dom, document, timers } = mount({ fetch: async (path, options) => {
+    if (path === '/api/status') return response(activityStatus({ settings }));
+    if (path === '/api/settings' && options.method === 'PATCH') {
+      if (fail) return response({}, 500);
+      settings = { ...settings, ...JSON.parse(options.body), version: settings.version + 1 }; return response(settings);
+    }
+  } });
+  try {
+    await settle();
+    const mode = document.getElementById('low-activity-mode'), start = document.getElementById('low-activity-start'), end = document.getElementById('low-activity-end');
+    const submit = async () => { document.getElementById('settings-form').dispatchEvent(new dom.window.Event('submit', { cancelable: true })); await settle(); };
+    assert.equal(document.getElementById('low-activity-time-fields').hidden, true); assert.equal(start.disabled, true);
+    mode.value = 'TIME_RANGE'; mode.dispatchEvent(new dom.window.Event('change'));
+    assert.equal(document.getElementById('low-activity-time-fields').hidden, false); assert.equal(start.required, true);
+    start.value = '22:30'; end.value = '07:15'; start.dispatchEvent(new dom.window.Event('input'));
+    await timers[0](); await submit();
+    assert.equal(mode.value, 'TIME_RANGE'); assert.equal(start.value, '22:30'); assert.equal(end.value, '07:15');
+    assert.match(document.getElementById('settings-message').textContent, /저장하지 못/);
+    fail = false; await submit();
+    assert.equal(settings.lowActivityMode, 'TIME_RANGE'); assert.equal(settings.lowActivityStart, '22:30');
+    assert.match(document.querySelector('#settings-alerts .detection-chip').textContent, /민감도 2.*22:30~07:15/);
+    mode.value = 'ALL_DAY'; mode.dispatchEvent(new dom.window.Event('change'));
+    assert.equal(document.getElementById('low-activity-time-fields').hidden, true); assert.equal(start.required, false);
+    mode.value = 'TIME_RANGE'; mode.dispatchEvent(new dom.window.Event('change'));
+    assert.equal(start.value, '22:30'); assert.equal(end.value, '07:15');
+  } finally { dom.window.close(); }
+});
+
+test('invalid scheduled times cannot save but switching detection off still works', async () => {
+  let settings = { ...activityStatus().settings, lowActivityMode: 'TIME_RANGE', lowActivityStart: '22:00', lowActivityEnd: '07:00' };
+  const { dom, document, calls } = mount({ fetch: async (path, options) => {
+    if (path === '/api/status') return response(activityStatus({ settings }));
+    if (path === '/api/settings' && options.method === 'PATCH') { settings = { ...settings, ...JSON.parse(options.body), version: 2 }; return response(settings); }
+  } });
+  try {
+    await settle();
+    const submit = async () => { document.getElementById('settings-form').dispatchEvent(new dom.window.Event('submit', { cancelable: true })); await settle(); };
+    const start = document.getElementById('low-activity-start'), end = document.getElementById('low-activity-end');
+    for (const pair of [['22:00', '22:00'], ['', '07:00']]) {
+      start.value = pair[0]; end.value = pair[1]; start.dispatchEvent(new dom.window.Event('input')); await submit();
+      assert.equal(calls.filter(call => call.method === 'PATCH').length, 0);
+      assert.match(document.getElementById('settings-message').textContent, /시작·종료/);
+    }
+    const enabled = document.getElementById('low-activity-enabled'); enabled.checked = false; enabled.dispatchEvent(new dom.window.Event('change')); await submit();
+    assert.equal(settings.lowActivityEnabled, false); assert.equal(settings.lowActivityStart, '22:00');
+    assert.equal(start.disabled, true); assert.equal(document.getElementById('low-activity-sensitivity').disabled, true);
+  } finally { dom.window.close(); }
+});
+
+test('outside a scheduled period the home still shows the actual measured activity without claiming detection', async () => {
+  const korea = new Date(Date.now() + 9 * 3600000);
+  const minutes = korea.getUTCHours() * 60 + korea.getUTCMinutes();
+  const stamp = offset => { const value = (minutes + offset) % 1440; return `${String(Math.floor(value / 60)).padStart(2, '0')}:${String(value % 60).padStart(2, '0')}`; };
+  const settings = { ...activityStatus().settings, lowActivityMode: 'TIME_RANGE', lowActivityStart: stamp(10), lowActivityEnd: stamp(20) };
+  const { dom, document } = mount({ fetch: async path => path === '/api/status' ? response(activityStatus({ settings })) : undefined });
+  try {
+    await settle(); assert.equal(document.getElementById('activity-meter').hidden, false);
+    assert.equal(document.getElementById('activity-score').textContent, '0.10');
+    assert.equal(document.getElementById('activity-state').textContent, '측정됨');
+    assert.match(document.getElementById('activity-help').textContent, /시간대 밖/);
+  } finally { dom.window.close(); }
+});
+
+test('stale heartbeat never shows current observation or developer-only copy', async () => {
   const { dom, document } = mount();
   try {
     await settle();
-    assert.match(document.getElementById('bed-state').textContent, /확인할 수 없/);
     assert.match(document.getElementById('sensor-state').textContent, /확인 불가/);
     assert.equal(document.getElementById('status-demo'), null);
     assert.doesNotMatch(document.getElementById('events-list').textContent, /시험 데이터|개발 시제품/);
@@ -56,8 +452,7 @@ test('sample or unclassified signals cannot show live measurement, timestamps or
     if (path === '/api/status') return response({
       isDemo: source, gateway: { connected: true, receivedAt: timestamp },
       sensor: { available: true, fresh: true, qualityStatus: 'AVAILABLE', measuredAt: timestamp },
-      bedState: 'OUT_OF_BED', bedExitedAt: new Date(Date.now() - 14 * 60000).toISOString(),
-      settings: { version: 1, nonReturnMinutes: 10, updatedAt: timestamp, appliedVersion: 1 },
+      settings: { version: 1, updatedAt: timestamp, appliedVersion: 1 },
     });
   } });
   try {
@@ -68,8 +463,6 @@ test('sample or unclassified signals cannot show live measurement, timestamps or
       assert.equal(document.getElementById('status-badge').classList.contains('success'), false);
       assert.equal(document.getElementById('measured-at').textContent, '기록 없음');
       assert.equal(document.getElementById('received-at').textContent, '기록 없음');
-      assert.equal(document.getElementById('bed-exit-info').hidden, true);
-      assert.match(document.getElementById('bed-state').textContent, /확인할 수 없/);
       assert.equal(document.getElementById('settings-application').textContent, '연결 필요');
       assert.equal(document.getElementById('settings-gateway-state').textContent, '연결 대기');
       assert.notEqual(document.getElementById('settings-sensor-state').textContent, '측정 중');
@@ -79,7 +472,6 @@ test('sample or unclassified signals cannot show live measurement, timestamps or
     assert.equal(document.getElementById('status-badge').textContent, '정상');
     assert.equal(document.getElementById('sensor-state').textContent, '측정 중');
     assert.notEqual(document.getElementById('measured-at').textContent, '기록 없음');
-    assert.equal(document.getElementById('bed-exit-info').hidden, false);
     assert.equal(document.getElementById('settings-application').textContent, '적용됨');
   } finally { dom.window.close(); }
 });
@@ -88,13 +480,13 @@ test('late filter responses cannot replace the newly selected filter', async () 
   let release;
   const { dom, document } = mount({ fetch: async (path) => {
     if (path.includes('type=FALL_SUSPECTED')) return new Promise((resolve) => { release = resolve; });
-    if (path.includes('type=NON_RETURN_WARNING')) return response({ items: [{ ...baseEvent, eventId: 'test-b', type: 'NON_RETURN_WARNING' }], nextCursor: null });
+    if (path.includes('type=FAULT')) return response({ items: [{ ...baseEvent, eventId: 'test-b', type: 'SENSOR_UNAVAILABLE' }], nextCursor: null });
   } });
   try {
     await settle();
     document.querySelector('[data-filter="FALL_SUSPECTED"]').click();
     await settle();
-    document.querySelector('[data-filter="NON_RETURN_WARNING"]').click();
+    document.querySelector('[data-filter="FAULT"]').click();
     await settle();
     release(response({ items: [baseEvent], nextCursor: null }));
     await settle();
@@ -160,10 +552,10 @@ test('failed settings save keeps typed input and does not claim a saved version'
   try {
     await settle();
     const savedAt = document.getElementById('settings-updated').textContent;
-    document.getElementById('non-return-minutes').value = '22';
+    document.getElementById('fall-alert-enabled').checked = false;
     document.getElementById('settings-form').dispatchEvent(new dom.window.Event('submit', { cancelable: true }));
     await settle();
-    assert.equal(document.getElementById('non-return-minutes').value, '22');
+    assert.equal(document.getElementById('fall-alert-enabled').checked, false);
     assert.equal(document.getElementById('settings-updated').textContent, savedAt);
     assert.match(document.getElementById('settings-message').textContent, /저장하지 못/);
     assert.equal(document.getElementById('settings-save').disabled, false);
@@ -177,57 +569,48 @@ test('non-JSON Live Preview response is reported as an API connection problem', 
     await settle();
     assert.match(document.getElementById('connection-message').textContent, /연결할 수 없습니다/);
     assert.equal(document.getElementById('settings-save').disabled, true);
-    assert.match(document.getElementById('bed-state').textContent, /확인할 수 없/);
   } finally { dom.window.close(); }
 });
 
 test('fresh communication cannot hide an unavailable, old or degraded measurement', async () => {
   let sensor = { available: true, qualityStatus: 'AVAILABLE', measuredAt: timestamp, fresh: false };
   const { dom, document, timers } = mount({ fetch: async (path) => {
-    if (path === '/api/status') return response({ isDemo: false, gateway: { connected: true, receivedAt: timestamp }, sensor, bedState: 'OUT_OF_BED', bedExitedAt: new Date(Date.now() - 14 * 60000).toISOString(), settings: { version: 1, nonReturnMinutes: 10, updatedAt: timestamp, appliedVersion: 1 } });
+    if (path === '/api/status') return response({ isDemo: false, gateway: { connected: true, receivedAt: timestamp }, sensor, settings: { version: 1, updatedAt: timestamp, appliedVersion: 1 } });
   } });
   try {
     await settle();
     assert.equal(document.getElementById('status-badge').textContent, '감지 확인 필요');
-    assert.match(document.getElementById('bed-state').textContent, /확인할 수 없/);
-    assert.equal(document.getElementById('bed-exit-info').hidden, true);
     for (const update of [{ available: false, fresh: true, qualityStatus: 'UNAVAILABLE' }, { available: true, fresh: true, qualityStatus: 'DEGRADED' }]) {
       sensor = { ...sensor, ...update }; await timers[0]();
       assert.equal(document.getElementById('status-badge').classList.contains('success'), false);
-      assert.equal(document.getElementById('bed-exit-info').hidden, true);
     }
     sensor = { ...sensor, available: true, fresh: true, qualityStatus: 'AVAILABLE' }; await timers[0]();
     assert.equal(document.getElementById('status-badge').textContent, '정상');
-    assert.equal(document.getElementById('bed-exit-info').hidden, false);
-    assert.match(document.getElementById('bed-exit-info').textContent, /14분 경과.*10분/);
   } finally { dom.window.close(); }
 });
 
 test('settings polling preserves edits and requires matching applied version', async () => {
-  let settings = { version: 1, nonReturnMinutes: 10, updatedAt: timestamp, appliedVersion: 1 };
+  let settings = { version: 1, updatedAt: timestamp, appliedVersion: 1 };
   const { dom, document, timers } = mount({ fetch: async (path, options) => {
-    if (path === '/api/status') return response({ isDemo: false, gateway: { connected: true }, sensor: { available: true, fresh: true, qualityStatus: 'AVAILABLE' }, bedState: 'IN_BED', settings });
+    if (path === '/api/status') return response({ isDemo: false, gateway: { connected: true }, sensor: { available: true, fresh: true, qualityStatus: 'AVAILABLE' }, settings });
     if (path === '/api/settings' && options.method === 'PATCH') {
-      settings = { ...settings, version: 2, nonReturnMinutes: 22 };
+      settings = { ...settings, version: 2, fallAlertEnabled: false };
       return response(settings);
     }
   } });
   try {
     await settle();
     assert.equal(document.getElementById('settings-application').textContent, '적용됨');
-    const input = document.getElementById('non-return-minutes');
-    input.value = '22'; input.dispatchEvent(new dom.window.Event('input'));
-    await timers[0](); assert.equal(input.value, '22');
+    const input = document.getElementById('fall-alert-enabled');
+    input.checked = false; input.dispatchEvent(new dom.window.Event('input'));
+    await timers[0](); assert.equal(input.checked, false);
     document.getElementById('settings-form').dispatchEvent(new dom.window.Event('submit', { cancelable: true }));
     await settle();
     assert.equal(document.getElementById('settings-application').textContent, '적용 확인 중');
-    assert.equal(document.getElementById('non-return-minutes').value, '22');
+    assert.equal(document.getElementById('fall-alert-enabled').checked, false);
     assert.equal(document.getElementById('settings-unsaved').hidden, true);
     settings.appliedVersion = 2; await timers[0]();
     assert.equal(document.getElementById('settings-application').textContent, '적용됨');
-    input.value = '0'; document.getElementById('settings-form').dispatchEvent(new dom.window.Event('submit', { cancelable: true }));
-    assert.equal(document.getElementById('settings-message').hidden, false);
-    assert.match(document.getElementById('settings-message').textContent, /1~1440/);
   } finally { dom.window.close(); }
 });
 
@@ -442,63 +825,34 @@ test('incident types stay visible while state and period collapse together', asy
   } finally { dom.window.close(); }
 });
 
-test('bed schedule saves with the threshold and polling preserves unsaved time edits', async () => {
-  let settings = { version: 1, nonReturnMinutes: 10, updatedAt: timestamp, bedMonitoringEnabled: true, bedMonitoringMode: 'ALL_DAY', bedMonitoringStart: '22:00', bedMonitoringEnd: '07:00', timeZone: 'Asia/Seoul' };
-  const { dom, document, timers, calls } = mount({ fetch: async (path, options) => {
-    if (path === '/api/status') return response({ isDemo: false, gateway: { connected: true }, sensor: { available: true, fresh: true, qualityStatus: 'AVAILABLE' }, bedState: 'IN_BED', settings: { ...settings, appliedVersion: 1 } });
-    if (path === '/api/settings' && options.method === 'PATCH') {
-      settings = { ...settings, ...JSON.parse(options.body), version: settings.version + 1 };
-      return response(settings);
-    }
+test('retired bed controls and filter stay absent even with legacy settings', async () => {
+  const { dom, document, calls } = mount({ fetch: async path => {
+    if (path === '/api/settings') return response({ version: 1, updatedAt: timestamp,
+      bedMonitoringEnabled: true, bedMonitoringMode: 'TIME_RANGE' });
   } });
   try {
     await settle();
-    assert.equal(document.getElementById('bed-monitoring-enabled').checked, true);
-    assert.equal(document.getElementById('bed-monitoring-times').hidden, true);
-    assert.equal(document.getElementById('bed-monitoring-start').disabled, true);
-    const group = document.getElementById('bed-alert-settings');
-    for (const id of ['bed-monitoring-start', 'bed-monitoring-end', 'non-return-minutes']) assert.equal(group.contains(document.getElementById(id)), true);
-    const mode = document.getElementById('bed-monitoring-mode');
-    mode.value = 'TIME_RANGE'; mode.dispatchEvent(new dom.window.Event('change'));
-    assert.equal(document.getElementById('bed-monitoring-times').hidden, false);
-    assert.equal(document.getElementById('bed-monitoring-start').disabled, false);
-    const end = document.getElementById('bed-monitoring-end'); end.value = '06:00'; end.dispatchEvent(new dom.window.Event('input'));
-    assert.equal(mode.value, 'TIME_RANGE', 'editing a time directly selects that custom window');
-    await timers[0]();
-    assert.equal(end.value, '06:00'); assert.equal(mode.value, 'TIME_RANGE');
-    document.getElementById('settings-form').dispatchEvent(new dom.window.Event('submit', { cancelable: true })); await settle();
-    assert.deepEqual(JSON.parse(calls.filter(call => call.method === 'PATCH').at(-1).body), {
-      nonReturnMinutes: 10, bedMonitoringEnabled: true, bedMonitoringMode: 'TIME_RANGE', bedMonitoringStart: '22:00', bedMonitoringEnd: '06:00',
-      fallAlertEnabled: true, sensorFaultAlertEnabled: true, gatewayFaultAlertEnabled: true,
-    });
-    assert.match(document.getElementById('bed-monitoring-summary').textContent, /22:00 ~ 06:00.*다음 날/);
-    assert.equal(document.getElementById('settings-application').textContent, '적용 확인 중');
-    end.value = '22:00'; end.dispatchEvent(new dom.window.Event('input'));
-    const beforeInvalid = calls.length;
-    document.getElementById('settings-form').dispatchEvent(new dom.window.Event('submit', { cancelable: true })); await settle();
-    assert.equal(calls.length, beforeInvalid);
-    assert.equal(document.getElementById('settings-message').hidden, false);
-    const enabled = document.getElementById('bed-monitoring-enabled'); enabled.checked = false; enabled.dispatchEvent(new dom.window.Event('change'));
-    assert.equal(mode.disabled, true); assert.equal(end.disabled, true);
-    assert.equal(document.getElementById('non-return-minutes').disabled, true);
-    assert.equal(document.getElementById('settings-save').disabled, false);
-    document.getElementById('settings-form').dispatchEvent(new dom.window.Event('submit', { cancelable: true })); await settle();
-    assert.equal(settings.bedMonitoringEnabled, false);
-    assert.match(document.getElementById('bed-monitoring-summary').textContent, /감지 꺼짐/);
-    assert.match(document.getElementById('settings-alerts').textContent, /미복귀 감지 꺼짐/);
+    for (const id of ['bed-state', 'bed-exit-info', 'bed-alert-settings', 'bed-monitoring-enabled', 'non-return-minutes']) {
+      assert.equal(document.getElementById(id), null);
+    }
+    assert.equal(document.querySelector('[data-filter="NON_RETURN_WARNING"]'), null);
+    assert.doesNotMatch(document.getElementById('settings-alerts').textContent, /미복귀/);
+    document.getElementById('settings-form').dispatchEvent(new dom.window.Event('submit', { cancelable: true }));
+    await settle();
+    assert.deepEqual(Object.keys(JSON.parse(calls.find(call => call.method === 'PATCH').body)).sort(),
+      ['fallAlertEnabled', 'gatewayFaultAlertEnabled', 'lowActivityEnabled', 'lowActivityEnd', 'lowActivityMinutes', 'lowActivityMode', 'lowActivityStart', 'lowActivityThreshold', 'sensorFaultAlertEnabled']);
   } finally { dom.window.close(); }
 });
 
 test('alert switches save independently while device state appears first and save appears last', async () => {
-  let settings = { version: 1, nonReturnMinutes: 10, updatedAt: timestamp,
-    bedMonitoringEnabled: true, bedMonitoringMode: 'ALL_DAY', bedMonitoringStart: '22:00', bedMonitoringEnd: '07:00',
+  let settings = { version: 1, updatedAt: timestamp,
     fallAlertEnabled: true, sensorFaultAlertEnabled: true, gatewayFaultAlertEnabled: true };
   const { dom, document, calls, timers } = mount({ url: 'http://127.0.0.1:3002/#settings', fetch: async (path, options) => {
     if (path === '/api/settings') {
       if (options.method === 'PATCH') settings = { ...settings, ...JSON.parse(options.body), version: settings.version + 1 };
       return response(settings);
     }
-    if (path === '/api/status') return response({ isDemo: false, gateway: { connected: true }, sensor: { available: true, fresh: true, qualityStatus: 'AVAILABLE' }, bedState: 'IN_BED', settings: { ...settings, appliedVersion: 1 } });
+    if (path === '/api/status') return response({ isDemo: false, gateway: { connected: true }, sensor: { available: true, fresh: true, qualityStatus: 'AVAILABLE' }, settings: { ...settings, appliedVersion: 1 } });
   } });
   try {
     await settle();
@@ -519,7 +873,7 @@ test('alert switches save independently while device state appears first and sav
     form.dispatchEvent(new dom.window.Event('submit', { cancelable: true })); await settle();
     const body = JSON.parse(calls.filter(call => call.method === 'PATCH').at(-1).body);
     assert.equal(body.fallAlertEnabled, false); assert.equal(body.sensorFaultAlertEnabled, false); assert.equal(body.gatewayFaultAlertEnabled, true);
-    assert.equal(body.nonReturnMinutes, 10); assert.equal(body.bedMonitoringMode, 'ALL_DAY');
+    assert.equal(body.nonReturnMinutes, undefined); assert.equal(body.bedMonitoringMode, undefined);
     assert.match(document.getElementById('settings-alerts').textContent, /낙상 의심 감지 꺼짐.*센싱 장애 감지 꺼짐.*기기 통신 장애 감지 켜짐/);
     assert.equal(document.getElementById('settings-application').textContent, '적용 확인 중');
   } finally { dom.window.close(); }
@@ -552,11 +906,11 @@ test('home distinguishes pending incidents, an empty result and a failed query',
 });
 
 test('unsaved edits, saving progress and saved versus applied states remain distinct', async () => {
-  let settings = { version: 1, nonReturnMinutes: 10, updatedAt: timestamp };
+  let settings = { version: 1, updatedAt: timestamp };
   let appliedVersion = 1;
   let finishSave;
   const { dom, document, timers } = mount({ fetch: async (path, options) => {
-    if (path === '/api/status') return response({ isDemo: false, gateway: { connected: true }, sensor: { available: true, fresh: true, qualityStatus: 'AVAILABLE' }, bedState: 'IN_BED', settings: { ...settings, appliedVersion } });
+    if (path === '/api/status') return response({ isDemo: false, gateway: { connected: true }, sensor: { available: true, fresh: true, qualityStatus: 'AVAILABLE' }, settings: { ...settings, appliedVersion } });
     if (path === '/api/settings') {
       if (options.method === 'PATCH') return new Promise(resolve => {
         finishSave = () => { settings = { ...settings, ...JSON.parse(options.body), version: 2 }; resolve(response(settings)); };
@@ -566,17 +920,17 @@ test('unsaved edits, saving progress and saved versus applied states remain dist
   } });
   try {
     await settle();
-    const input = document.getElementById('non-return-minutes');
+    const input = document.getElementById('fall-alert-enabled');
     const notice = document.getElementById('settings-unsaved');
     const form = document.getElementById('settings-form');
     assert.equal(notice.hidden, true);
-    input.value = '22'; input.dispatchEvent(new dom.window.Event('input'));
+    input.checked = false; input.dispatchEvent(new dom.window.Event('input'));
     assert.equal(notice.hidden, false);
-    input.value = '10'; input.dispatchEvent(new dom.window.Event('input'));
+    input.checked = true; input.dispatchEvent(new dom.window.Event('input'));
     assert.equal(notice.hidden, true, 'returning to the saved value clears the notice');
-    input.value = '22'; input.dispatchEvent(new dom.window.Event('input'));
+    input.checked = false; input.dispatchEvent(new dom.window.Event('input'));
     await timers[0]();
-    assert.equal(input.value, '22'); assert.equal(notice.hidden, false);
+    assert.equal(input.checked, false); assert.equal(notice.hidden, false);
     form.dispatchEvent(new dom.window.Event('submit', { cancelable: true })); await settle();
     assert.match(notice.textContent, /저장하고/);
     assert.equal(form.getAttribute('aria-busy'), 'true');
@@ -592,7 +946,7 @@ test('unsaved edits, saving progress and saved versus applied states remain dist
     appliedVersion = 2; await timers[0]();
     assert.equal(document.getElementById('settings-application').textContent, '적용됨');
     assert.equal(document.querySelectorAll('#settings-alerts .detection-chip').length, 4);
-    assert.match(document.querySelector('#settings-alerts .detection-chip').textContent, /미복귀 감지 켜짐/);
+    assert.match(document.querySelector('#settings-alerts .detection-chip:nth-child(2)').textContent, /낙상 의심 감지 꺼짐/);
     assert.equal(dom.window.getComputedStyle(document.querySelector('.toggle-row')).minHeight, '48px');
     assert.equal(dom.window.getComputedStyle(document.querySelector('.back')).minHeight, '44px');
   } finally { dom.window.close(); }
@@ -625,8 +979,8 @@ test('date groups merge across pages, deduplicate incidents and escape handling 
     assert.equal(resolved.querySelector('.event-reason').textContent, reason);
     assert.equal(resolved.querySelector('img'), null);
     assert.equal(resolved.querySelector('svg').getAttribute('aria-hidden'), 'true');
-    assert.equal(resolved.querySelector('svg use').getAttribute('href'), '#i-bed');
-    assert.match(resolved.getAttribute('aria-label'), /미복귀.*해소됨/);
+    assert.equal(resolved.querySelector('svg use').getAttribute('href'), '#i-list');
+    assert.match(resolved.getAttribute('aria-label'), /미복귀 · 이전 기록.*해소됨/);
     assert.equal(document.querySelector('#home-events .event-footer'), null);
   } finally { dom.window.close(); }
 });
@@ -654,24 +1008,21 @@ test('measurement age and settings application require actual signals and surviv
     if (phase === 'failed') return response({ error: { message: 'offline' } }, 500);
     return response({ isDemo: phase === 'sample', gateway: { connected: phase !== 'stale', receivedAt: timestamp },
       sensor: { available: true, fresh: true, measuredAt: timestamp, ageSeconds: 7, qualityStatus: 'AVAILABLE' },
-      fetchedAt: timestamp, bedState: 'OUT_OF_BED', bedExitedAt: new Date(Date.now() - 5 * 60000).toISOString(),
+      fetchedAt: timestamp,
       settings: { version: 2, appliedVersion: 1, updatedAt: timestamp, nonReturnMinutes: 10 } });
   } });
   try {
     await settle();
     assert.match(document.getElementById('observation-age').textContent, /측정 7초 전/);
-    assert.equal(document.getElementById('bed-exited-at').hidden, false);
     assert.equal(document.getElementById('settings-application').textContent, '적용 확인 중');
     phase = 'stale'; await timers[0]();
     assert.equal(document.getElementById('settings-application').textContent, '연결 필요');
-    assert.equal(document.getElementById('bed-exited-at').hidden, true);
     phase = 'sample'; await timers[0]();
     assert.match(document.getElementById('observation-age').textContent, /측정 기록 없음/);
     assert.doesNotMatch(document.getElementById('observation-age').textContent, /7초 전/);
     assert.equal(document.getElementById('settings-application').textContent, '연결 필요');
     phase = 'failed'; await timers[0]();
     assert.match(document.getElementById('observation-age').textContent, /조회하지 못/);
-    assert.equal(document.getElementById('bed-exited-at').hidden, true);
   } finally { dom.window.close(); }
 });
 

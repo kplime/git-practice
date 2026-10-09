@@ -1,10 +1,11 @@
 const { withTransaction } = require('./db');
 
 const gatewayId = 'sample-room-gateway';
-const eventTypes = ['FALL_SUSPECTED', 'NON_RETURN_WARNING', 'SENSOR_UNAVAILABLE', 'GATEWAY_OFFLINE'];
+const fixtureSource = 'ui-sample-v2';
+const eventTypes = ['FALL_SUSPECTED', 'LOW_ACTIVITY', 'SENSOR_UNAVAILABLE', 'GATEWAY_OFFLINE'];
 const reasons = {
   FALL_SUSPECTED: '직접 확인 결과 빠르게 앉는 동작이었습니다. 다친 곳 없이 일상 활동을 이어갔습니다.',
-  NON_RETURN_WARNING: '화장실 이용 후 침대로 돌아온 것을 직접 확인했습니다.',
+  LOW_ACTIVITY: '직접 확인 결과 앉아서 쉬고 있었습니다. 대화와 움직임을 확인하고 기록했습니다.',
   SENSOR_UNAVAILABLE: '센서 케이블을 다시 연결하고 감지 상태가 복구된 것을 확인했습니다.',
   GATEWAY_OFFLINE: '기기의 네트워크를 다시 연결하고 신호 수신을 확인했습니다.',
 };
@@ -13,11 +14,11 @@ function createDemoEvents(now = Date.now()) {
   return Array.from({ length: 24 }, (_, index) => {
     const first = [
       { type: 'FALL_SUSPECTED', state: 'OPEN', minutes: 1 },
-      { type: 'NON_RETURN_WARNING', state: 'OPEN', minutes: 4 },
+      { type: 'LOW_ACTIVITY', state: 'OPEN', minutes: 4 },
       { type: 'FALL_SUSPECTED', state: 'ACKNOWLEDGED', minutes: 18 },
       { type: 'SENSOR_UNAVAILABLE', state: 'RESOLVED', minutes: 60 },
       { type: 'GATEWAY_OFFLINE', state: 'RESOLVED', minutes: 75 },
-      { type: 'NON_RETURN_WARNING', state: 'ACKNOWLEDGED', minutes: 140 },
+      { type: 'LOW_ACTIVITY', state: 'ACKNOWLEDGED', minutes: 140 },
     ];
     const item = first[index] || {
       type: eventTypes[index % eventTypes.length], state: 'RESOLVED',
@@ -25,7 +26,8 @@ function createDemoEvents(now = Date.now()) {
     };
     const occurred = now - item.minutes * 60000;
     return {
-      eventId: `sample-ui-${String(index + 1).padStart(2, '0')}`,
+      // New fixture IDs leave all v1 records and guardian actions untouched.
+      eventId: `sample-ui-v2-${String(index + 1).padStart(2, '0')}`,
       gatewayId, type: item.type, state: item.state,
       occurredAt: new Date(occurred).toISOString(),
       detectedAt: new Date(occurred + 1000).toISOString(),
@@ -36,7 +38,13 @@ function createDemoEvents(now = Date.now()) {
       score: item.type === 'FALL_SUSPECTED' ? 0.82 : null,
       qualityStatus: item.type === 'SENSOR_UNAVAILABLE' ? 'UNAVAILABLE' : 'AVAILABLE',
       modelVersion: 'sample-only', isDemo: true,
-      details: { source: 'ui-sample-v1', layoutId: 'sample-room-01' },
+      details: { source: fixtureSource, layoutId: 'sample-room-01',
+        ...(item.type === 'LOW_ACTIVITY' ? {
+          lowSince: new Date(occurred - 30 * 60000).toISOString(), durationSeconds: 1801,
+          thresholdMinutes: 30, activityThreshold: 0.2, activityScore: 0.08,
+          settingsVersion: 1, calibrationVersion: 'sample-room-v2',
+        } : {}),
+      },
     };
   });
 }
@@ -50,7 +58,7 @@ async function seedDemo(now = Date.now()) {
     for (const event of createDemoEvents(now)) {
       const previous = await client.query('SELECT is_demo, payload_json FROM events WHERE event_id = $1', [event.eventId]);
       if (previous.rowCount) {
-        if (!previous.rows[0].is_demo || previous.rows[0].payload_json.details?.source !== 'ui-sample-v1') {
+        if (!previous.rows[0].is_demo || previous.rows[0].payload_json.details?.source !== fixtureSource) {
           throw new Error('Sample event ID is already used by other data.');
         }
         continue; // Keep the user's acknowledgements, reasons and timestamps on repeat runs.
@@ -77,4 +85,4 @@ async function seedDemo(now = Date.now()) {
   });
 }
 
-module.exports = { seedDemo, createDemoEvents, gatewayId };
+module.exports = { seedDemo, createDemoEvents, gatewayId, fixtureSource };

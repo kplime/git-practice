@@ -12,6 +12,9 @@ pool.on('error', (error) => {
 });
 
 async function initializeDatabase() {
+  // Retain legacy bed columns and NON_RETURN_WARNING for historical data only.
+  // Current APIs no longer expose/edit bed settings or create non-return events.
+  // Never reinterpret historical non-return events as low activity.
   await pool.query(`
     CREATE TABLE IF NOT EXISTS gateways (
       gateway_id TEXT PRIMARY KEY,
@@ -29,7 +32,7 @@ async function initializeDatabase() {
       event_id TEXT PRIMARY KEY,
       gateway_id TEXT NOT NULL REFERENCES gateways(gateway_id),
       event_type TEXT NOT NULL CHECK (event_type IN (
-        'FALL_SUSPECTED', 'NON_RETURN_WARNING', 'SENSOR_UNAVAILABLE', 'GATEWAY_OFFLINE'
+        'FALL_SUSPECTED', 'LOW_ACTIVITY', 'NON_RETURN_WARNING', 'SENSOR_UNAVAILABLE', 'GATEWAY_OFFLINE'
       )),
       occurred_at TIMESTAMPTZ NOT NULL,
       detected_at TIMESTAMPTZ NOT NULL,
@@ -77,6 +80,55 @@ async function initializeDatabase() {
     ALTER TABLE settings ADD COLUMN IF NOT EXISTS fall_alert_enabled BOOLEAN NOT NULL DEFAULT TRUE;
     ALTER TABLE settings ADD COLUMN IF NOT EXISTS sensor_fault_alert_enabled BOOLEAN NOT NULL DEFAULT TRUE;
     ALTER TABLE settings ADD COLUMN IF NOT EXISTS gateway_fault_alert_enabled BOOLEAN NOT NULL DEFAULT TRUE;
+    ALTER TABLE gateways ADD COLUMN IF NOT EXISTS activity_json JSONB;
+    ALTER TABLE gateways ADD COLUMN IF NOT EXISTS activity_watermark_at TIMESTAMPTZ;
+    ALTER TABLE settings ADD COLUMN IF NOT EXISTS low_activity_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE settings ADD COLUMN IF NOT EXISTS low_activity_minutes INTEGER NOT NULL DEFAULT 30
+      CHECK (low_activity_minutes BETWEEN 1 AND 1440);
+    ALTER TABLE settings ADD COLUMN IF NOT EXISTS low_activity_threshold DOUBLE PRECISION NOT NULL DEFAULT 0.2
+      CHECK (low_activity_threshold BETWEEN 0 AND 1);
+    ALTER TABLE settings ADD COLUMN IF NOT EXISTS low_activity_mode TEXT NOT NULL DEFAULT 'ALL_DAY'
+      CHECK (low_activity_mode IN ('ALL_DAY', 'TIME_RANGE'));
+    ALTER TABLE settings ADD COLUMN IF NOT EXISTS low_activity_start TIME(0) NOT NULL DEFAULT '22:00';
+    ALTER TABLE settings ADD COLUMN IF NOT EXISTS low_activity_end TIME(0) NOT NULL DEFAULT '07:00';
+    DO $$ BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'settings'::regclass
+        AND conname = 'settings_low_activity_schedule_check') THEN
+        ALTER TABLE settings ADD CONSTRAINT settings_low_activity_schedule_check
+          CHECK (low_activity_start <> low_activity_end);
+      END IF;
+    END $$;
+    DO $$ BEGIN
+      IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'events'::regclass
+        AND conname = 'events_event_type_check' AND position('LOW_ACTIVITY' in pg_get_constraintdef(oid)) = 0) THEN
+        ALTER TABLE events DROP CONSTRAINT events_event_type_check;
+        ALTER TABLE events ADD CONSTRAINT events_event_type_check CHECK (event_type IN (
+          'FALL_SUSPECTED', 'LOW_ACTIVITY', 'NON_RETURN_WARNING', 'SENSOR_UNAVAILABLE', 'GATEWAY_OFFLINE'
+        ));
+      END IF;
+    END $$;
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS activity_history (
+      gateway_id TEXT NOT NULL REFERENCES gateways(gateway_id),
+      generation INTEGER NOT NULL CHECK (generation >= 1),
+      sequence INTEGER NOT NULL CHECK (sequence >= 0),
+      sampled_at TIMESTAMPTZ NOT NULL,
+      measured_at TIMESTAMPTZ,
+      received_at TIMESTAMPTZ NOT NULL,
+      window_started_at TIMESTAMPTZ,
+      score DOUBLE PRECISION CHECK (score BETWEEN 0 AND 1),
+      quality_status TEXT NOT NULL,
+      model_version TEXT,
+      calibration_version TEXT,
+      reason TEXT CHECK (reason IN ('NO_ACTIVITY', 'SENSING_UNAVAILABLE', 'STALE_MEASUREMENT', 'REPEATED_MEASUREMENT')),
+      PRIMARY KEY (gateway_id, generation, sequence),
+      CHECK ((score IS NULL AND reason IS NOT NULL) OR
+        (score IS NOT NULL AND reason IS NULL AND window_started_at IS NOT NULL AND window_started_at < sampled_at))
+    );
+    CREATE INDEX IF NOT EXISTS idx_activity_history_period
+      ON activity_history(gateway_id, sampled_at DESC, generation DESC, sequence DESC);
   `);
 
   await pool.query(`

@@ -4,8 +4,8 @@ const { seedDemo, gatewayId } = require('../src/demo-data');
 async function main() {
   const args = process.argv.slice(2);
   const seedOnly = args.includes('--seed-only') || !args.includes('--heartbeat');
-  const scenario = args.find((arg) => arg.startsWith('--scenario='))?.split('=')[1] || 'out-of-bed';
-  if (!['healthy', 'out-of-bed', 'sensor-offline', 'gateway-offline'].includes(scenario)) throw new Error('Invalid scenario.');
+  const scenario = args.find((arg) => arg.startsWith('--scenario='))?.split('=')[1] || 'healthy';
+  if (!['healthy', 'sensor-offline', 'gateway-offline'].includes(scenario)) throw new Error('Invalid scenario.');
   await initializeDatabase();
   const count = await seedDemo();
   console.log(`Sample events: inserted ${count}; 24 fixtures available. Existing handling records were kept.`);
@@ -18,7 +18,6 @@ async function main() {
   if (!token || token.startsWith('replace-with-')) throw new Error('Set GATEWAY_TOKEN first.');
   const { rows: [previous] } = await pool.query('SELECT generation FROM gateways WHERE gateway_id=$1', [gatewayId]);
   const generation = previous.generation + 1;
-  const bedExitedAt = new Date(Date.now() - 14 * 60000).toISOString();
   let sequence = 0;
   let stopped = false;
   let timer;
@@ -38,8 +37,6 @@ async function main() {
       sensorAvailable: scenario !== 'sensor-offline',
       qualityStatus: scenario === 'sensor-offline' ? 'UNAVAILABLE' : 'AVAILABLE',
       measuredAt: scenario === 'sensor-offline' ? null : new Date().toISOString(),
-      bedState: scenario === 'out-of-bed' ? 'OUT_OF_BED' : scenario === 'sensor-offline' ? 'UNKNOWN' : 'IN_BED',
-      bedExitedAt: scenario === 'out-of-bed' ? bedExitedAt : null,
       appliedSettingsVersion: settings.version,
     });
   }

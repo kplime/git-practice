@@ -20,12 +20,12 @@ def main():
     gateway_id = f"demo-{uuid.uuid4()}"
     status = {
         "gatewayId": gateway_id, "generation": 1, "sequence": 0,
-        "sensorAvailable": True, "qualityStatus": "AVAILABLE", "bedState": "UNKNOWN",
+        "sensorAvailable": True, "qualityStatus": "AVAILABLE",
         "measuredAt": utc_now(), "isDemo": True,
     }
     try:
         client.send_status(status)
-        for event_type in ("FALL_SUSPECTED", "NON_RETURN_WARNING", "SENSOR_UNAVAILABLE", "GATEWAY_OFFLINE"):
+        for event_type in ("FALL_SUSPECTED", "SENSOR_UNAVAILABLE", "GATEWAY_OFFLINE"):
             timestamp = utc_now()
             event_id = str(uuid.uuid4())
             result = client.send_event({
